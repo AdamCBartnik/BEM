@@ -53,15 +53,16 @@ tested and usable, just not what this class uses by default. The
 axisymmetric solve is both far cheaper (tens of profile nodes instead of
 thousands of triangles -- direct linear solve, not GMRES) and at least as
 accurate: on-surface field error (r = R exactly, where particles are
-actually emitted) shrinks monotonically from ~35% at n_theta=10 to ~5% at
-n_theta=60, matching the general 3D approach's accuracy at a given
-resolution while costing roughly two orders of magnitude less per field
-evaluation (a few ms per point here vs. 100+ ms there) -- see
+actually emitted) shrinks monotonically with profile resolution, matching
+the general 3D approach's accuracy at a given resolution while costing
+roughly two orders of magnitude less per field evaluation -- see
 `bem.axisymmetric`'s module docstring for the near-surface regularization
-this shares with `bem.panel_field`, and for a normalization bug (a missing
+this shares with `bem.panel_field`, for a normalization bug (a missing
 factor of 2*pi) that a first version of this class's validation caught via
-a basic shell-theorem sanity check, not the point-by-point comparisons
-that had already passed.
+a basic shell-theorem sanity check (not the point-by-point comparisons
+that had already passed), and for the fully-vectorized (numpy or cupy)
+field evaluation `evaluate` uses -- `xp='gpu'` here runs the field
+evaluation itself on the GPU, not just the array bookkeeping around it.
 """
 
 import numpy as np
@@ -89,19 +90,23 @@ class HemisphericalTipBEMField:
     n_theta : int, optional
         Number of profile nodes from pole to pole -- see
         `bem.mesh.sphere_profile`.
-    refine_ratio, max_depth : optional
-        Passed through to `bem.axisymmetric.evaluate_axisymmetric_field`.
+    n_subdiv : int, optional
+        Fixed (non-adaptive) sub-panels per profile segment used by the
+        cached field-evaluation quadrature -- see
+        `bem.axisymmetric.evaluate_axisymmetric_field`.
     xp : module, optional
-        Only used to shape/type the returned field array; the BEM solve
-        itself always runs on numpy regardless of what's passed here.
+        numpy or cupy. The BEM *solve* always runs on numpy/CPU (a small,
+        one-time direct linear solve -- no benefit from the GPU there),
+        but `evaluate`'s field computation runs entirely on this backend,
+        including the elliptic-integral kernel evaluations themselves
+        (see `bem.axisymmetric._ellip_ke`).
     """
 
-    def __init__(self, Ez, R, n_theta=40, refine_ratio=1.0, max_depth=20, xp=np):
+    def __init__(self, Ez, R, n_theta=40, n_subdiv=8, xp=np):
         self.Ez = float(Ez)
         self.R = float(R)
         self.xp = xp
-        self.refine_ratio = refine_ratio
-        self.max_depth = max_depth
+        self.n_subdiv = n_subdiv
 
         profile = sphere_profile(self.R, n_theta=n_theta)
         Ez_ = self.Ez
@@ -123,15 +128,15 @@ class HemisphericalTipBEMField:
             this solve is valid for (r < R, or z < 0 away from the tip) --
             same convention as `fields.HemisphericalTipField.evaluate`.
         """
-        position = np.asarray(position, dtype=float)
-        r = np.linalg.norm(position, axis=-1)
+        xp = self.xp
+        position = xp.asarray(position, dtype=float)
+        r = xp.linalg.norm(position, axis=-1)
         valid = (r >= self.R * (1.0 - 1e-6)) & (position[..., 2] >= 0.0)
 
-        E_uniform = np.zeros_like(position)
+        E_uniform = xp.zeros_like(position)
         E_uniform[..., 2] = self.Ez
 
-        E_pert = self.solution.field(position, refine_ratio=self.refine_ratio, max_depth=self.max_depth)
+        E_pert = self.solution.field(position, n_subdiv=self.n_subdiv, xp=xp)
 
         E = E_uniform + E_pert
-        E = np.where(valid[..., None], E, 0.0)
-        return self.xp.asarray(E)
+        return xp.where(valid[..., None], E, 0.0)

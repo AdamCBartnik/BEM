@@ -56,25 +56,23 @@ def test_uniform_sphere_field_matches_shell_theorem():
     its own surface charge density (the shell theorem's local form, and
     the standard single-layer jump condition) -- this is the physical
     sanity check that caught the missing-2*pi normalization bug that the
-    point-by-point elliptic-integral checks above did not."""
-    from specific_particle_tracer.bem.axisymmetric import _segment_field
+    point-by-point elliptic-integral checks above did not. Also exercises
+    evaluate_axisymmetric_field's vectorized (fixed-quadrature) path
+    directly, away from the near-surface regularization (points here are
+    a comfortable 0.1% of R outside the profile)."""
+    from specific_particle_tracer.bem.axisymmetric import evaluate_axisymmetric_field
 
     R = 50e-9
     profile = sphere_cap_profile(R, n_theta=40, theta_max=np.pi)
     sigma0 = 5.0
-
-    def raw_field(rho_f, z_f):
-        e_rho = e_z = 0.0
-        for j in range(len(profile) - 1):
-            p0, p1 = profile[j], profile[j + 1]
-            er, ez = _segment_field(rho_f, z_f, p0, p1, sigma0, sigma0, 1.0, 20)
-            e_rho += er
-            e_z += ez
-        return e_rho, e_z
+    sigma = np.full(len(profile), sigma0)
 
     eps = 1e-3 * R
-    _, e_z_pole = raw_field(0.0, R + eps)
-    e_rho_equator, _ = raw_field(R + eps, 0.0)
+    points = np.array([[0.0, 0.0, R + eps], [R + eps, 0.0, 0.0]])
+    E = evaluate_axisymmetric_field(profile, sigma, points)
+
+    e_z_pole = E[0, 2]
+    e_rho_equator = E[1, 0]
 
     assert abs(e_z_pole - sigma0) / sigma0 < 0.1
     assert abs(e_rho_equator - sigma0) / sigma0 < 0.1

@@ -34,19 +34,20 @@ class HemisphericalTipBEMGeometry(geometry_module.Geometry):
         `fields.GunField.Ez`.
     R : float
         Tip radius [m].
-    n_theta, refine_ratio, max_depth : optional
+    n_theta, n_subdiv : optional
         Passed through to `HemisphericalTipBEMField` -- see there for what
         they trade off (profile resolution vs. solve/evaluate cost and
         accuracy).
     kill_z_below : float or None, optional
         Same meaning as `geometry.HemisphericalTip`'s.
     xp : module, optional
-        Only used to shape/type the returned field array; the BEM solve
-        itself always runs on numpy/bempp regardless of what's passed here
-        (matching `HemisphericalTipBEMField`) -- the tracker rebuilds this
-        Geometry via `worker_args`/`from_worker_args` on whatever backend
-        it's actually using, which re-solves the BEM problem from scratch
-        (see `worker_args`'s docstring below for the cost this implies).
+        numpy or cupy. The BEM solve always runs on numpy/CPU regardless
+        of what's passed here (matching `HemisphericalTipBEMField`), but
+        `field`'s evaluation runs on this backend -- the tracker rebuilds
+        this Geometry via `worker_args`/`from_worker_args` on whatever
+        backend it's actually using, which re-solves the BEM problem from
+        scratch (see `worker_args`'s docstring below for the cost this
+        implies).
     """
 
     def __init__(
@@ -54,24 +55,21 @@ class HemisphericalTipBEMGeometry(geometry_module.Geometry):
         E_gun,
         R,
         n_theta=40,
-        refine_ratio=1.0,
-        max_depth=20,
+        n_subdiv=8,
         kill_z_below=0.0,
         xp=np,
     ):
         self.E_gun = float(E_gun)
         self.R = float(R)
         self.n_theta = n_theta
-        self.refine_ratio = refine_ratio
-        self.max_depth = max_depth
+        self.n_subdiv = n_subdiv
         self.kill_z_below = kill_z_below
         self.xp = xp
         self._field = HemisphericalTipBEMField(
             E_gun,
             R,
             n_theta=n_theta,
-            refine_ratio=refine_ratio,
-            max_depth=max_depth,
+            n_subdiv=n_subdiv,
             xp=xp,
         )
 
@@ -107,20 +105,18 @@ class HemisphericalTipBEMGeometry(geometry_module.Geometry):
             self.E_gun,
             self.R,
             self.n_theta,
-            self.refine_ratio,
-            self.max_depth,
+            self.n_subdiv,
             self.kill_z_below,
         )
 
     @classmethod
     def _from_worker_args(cls, args, xp=np):
-        E_gun, R, n_theta, refine_ratio, max_depth, kill_z_below = args
+        E_gun, R, n_theta, n_subdiv, kill_z_below = args
         return cls(
             E_gun,
             R,
             n_theta=n_theta,
-            refine_ratio=refine_ratio,
-            max_depth=max_depth,
+            n_subdiv=n_subdiv,
             kill_z_below=kill_z_below,
             xp=xp,
         )
