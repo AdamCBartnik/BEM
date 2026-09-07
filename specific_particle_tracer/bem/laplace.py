@@ -1,7 +1,23 @@
-"""Exterior Laplace boundary element solver: given a conductor surface mesh
-and Dirichlet data on it, solve for the induced surface charge (Neumann
-data), and evaluate the resulting potential/field anywhere in the exterior
-region.
+"""Exterior Laplace boundary element solver, via the indirect (charge-
+simulation) method: represent the potential as phi_pert(x) = S[sigma](x)
+for x exterior, where S is the single-layer potential and sigma an unknown
+surface density, solved so that S[sigma] matches given Dirichlet data on
+the boundary -- a first-kind boundary integral equation V sigma = g (V the
+single-layer boundary operator).
+
+This is deliberately simpler than the "direct" formulation (solve for a
+Neumann trace t given the Dirichlet trace g, reconstruct the potential as
+S[t] - D[g]) this project tried first: reconstructing a *field* from that
+mixed representation needs the gradient of the double-layer potential, a
+hypersingular (~1/r^3) kernel that turned out to be unusable close to a
+panel (see git history, and bem.panel_field's module docstring). Indirect/
+CSM needs only the single-layer potential's own gradient (~1/r^2, the same
+kernel this project's Coulomb-law term already validated cleanly), at the
+cost of solving a first-kind rather than second-kind system -- generally
+more ill-conditioned, so if GMRES struggles or accuracy stays poor close
+to a panel, a first thing to try is a dedicated near-singular quadrature
+transform (Telles' or the Johnston-Elliott sinh transform) on this
+module's own Coulomb integral, not reverting to the direct formulation.
 
 Meant to be used with the superposition trick for a cathode's static field:
 the true total potential diverges at infinity (it contains the uniform
@@ -19,31 +35,28 @@ hemisphere-tip application of this.
 import numpy as np
 import bempp_cl.api as bempp_api
 
-from .panel_field import evaluate_panel_field
+from .panel_field import evaluate_coulomb_field
 
 
 class ExteriorLaplaceSolution:
-    """The solution (Dirichlet + solved Neumann data) of an exterior Laplace
-    Dirichlet problem on one conductor surface mesh: phi harmonic outside
-    the surface, matching given Dirichlet data g on the surface, decaying
-    at infinity.
+    """The solution (Dirichlet data + solved surface charge density) of an
+    exterior Laplace Dirichlet problem on one conductor surface mesh: phi
+    harmonic outside the surface, matching given Dirichlet data g on the
+    surface, decaying at infinity.
 
     Build with `ExteriorLaplaceSolution.solve(vertices, elements, dirichlet_fn)`.
     """
 
-    def __init__(self, space, dirichlet_fun, neumann_fun):
+    def __init__(self, space, dirichlet_fun, sigma_fun):
         self.space = space
         self.dirichlet_fun = dirichlet_fun
-        self.neumann_fun = neumann_fun
+        self.sigma_fun = sigma_fun
 
     @classmethod
     def solve(cls, vertices, elements, dirichlet_fn, gmres_tol=1e-8):
-        """Solve for the surface Neumann data given Dirichlet data g.
-
-        Uses the standard direct boundary-integral formulation for the
-        exterior Dirichlet problem: (0.5*I + K) g = V t, solved for the
-        unknown Neumann trace t by GMRES (K the double-layer operator, V
-        the single-layer operator, I the identity/mass matrix).
+        """Solve for the surface charge density sigma whose single-layer
+        potential matches the given Dirichlet data g (the indirect/charge-
+        simulation method -- see module docstring).
 
         Parameters
         ----------
@@ -67,38 +80,27 @@ class ExteriorLaplaceSolution:
         dirichlet_fun = bempp_api.GridFunction(space, fun=_dirichlet_data)
 
         slp = bempp_api.operators.boundary.laplace.single_layer(space, space, space)
-        dlp = bempp_api.operators.boundary.laplace.double_layer(space, space, space)
-        identity = bempp_api.operators.boundary.sparse.identity(space, space, space)
-
-        rhs = (0.5 * identity + dlp) * dirichlet_fun
-        neumann_fun, info = bempp_api.linalg.gmres(slp, rhs, tol=gmres_tol)
+        sigma_fun, info = bempp_api.linalg.gmres(slp, dirichlet_fun, tol=gmres_tol)
         if info != 0:
             raise RuntimeError(f"GMRES did not converge (info={info})")
 
-        return cls(space, dirichlet_fun, neumann_fun)
+        return cls(space, dirichlet_fun, sigma_fun)
 
     def potential(self, points):
-        """Perturbation potential phi_pert at `points`, shape (..., 3).
-
-        Returns an array of shape points.shape[:-1], via the exterior
-        representation formula phi_pert(x) = (S t)(x) - (D g)(x).
-        """
+        """Perturbation potential phi_pert = S[sigma] at `points`, shape
+        (..., 3). Returns an array of shape points.shape[:-1]."""
         points = np.asarray(points, dtype=float)
         shape = points.shape[:-1]
         flat = points.reshape(-1, 3).T  # bempp point convention: (3, n)
 
         slp_pot = bempp_api.operators.potential.laplace.single_layer(self.space, flat)
-        dlp_pot = bempp_api.operators.potential.laplace.double_layer(self.space, flat)
-        phi = (slp_pot * self.neumann_fun - dlp_pot * self.dirichlet_fun).ravel()
+        phi = (slp_pot * self.sigma_fun).ravel()
         return phi.reshape(shape)
 
     def field(self, points, refine_ratio=1.0, max_depth=6):
         """Perturbation field E_pert = -grad(phi_pert) at `points`, by
-        direct adaptive-quadrature integration of the field kernel over
-        every mesh panel -- see `bem.panel_field` for why (no finite
-        differences: differencing the potential right next to or on a
-        panel is a classic hard case for BEM, and this project's own
-        earlier attempt at it confirmed as much).
+        direct adaptive-quadrature integration of the Coulomb kernel over
+        every mesh panel -- see `bem.panel_field` (no finite differences).
 
         DOF index i corresponds exactly to `vertices[:, i]` for the P1
         spaces used throughout this project (checked against BEMpp's
@@ -108,17 +110,14 @@ class ExteriorLaplaceSolution:
         Parameters
         ----------
         points : ndarray, shape (..., 3)
-        refine_ratio, max_depth : see `panel_field.evaluate_panel_field`.
+        refine_ratio, max_depth : see `panel_field.evaluate_coulomb_field`.
 
         Returns
         -------
-        E : ndarray, same shape as `points`. Not accurate for a point
-            sitting exactly on the mesh surface -- see `panel_field`'s
-            module docstring.
+        E : ndarray, same shape as `points`.
         """
         grid = self.space.grid
-        g_nodal = np.real(self.dirichlet_fun.coefficients)
-        t_nodal = np.real(self.neumann_fun.coefficients)
-        return evaluate_panel_field(
-            grid.vertices, grid.elements, g_nodal, t_nodal, points, refine_ratio=refine_ratio, max_depth=max_depth
+        sigma_nodal = np.real(self.sigma_fun.coefficients)
+        return evaluate_coulomb_field(
+            grid.vertices, grid.elements, sigma_nodal, points, refine_ratio=refine_ratio, max_depth=max_depth
         )

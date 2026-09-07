@@ -46,20 +46,27 @@ BEM problem:
    has the identical open-surface problem an asymmetric bump does.
 
 Known limitation: `evaluate` gets its field from `bem.panel_field` (direct
-analytic integration of the field kernel over every mesh panel -- see that
-module for why, and for the desingularization trick that makes the
-double-layer term converge at all). That is accurate close to the tip --
-sub-percent error by r ~ 1.05R, not just far away -- but not *exactly* on
-the mesh surface (r = R exactly), where error is still tens of percent and
-barely improves with deeper adaptive subdivision. That's because the
-exterior representation formula panel_field implements is only valid off
-the surface; the correct on-surface formula is the trivial one instead --
-a grounded conductor's surface field is purely normal, set directly by the
-already-solved surface charge (Neumann trace) `t`, no potential or its
-gradient needed at all -- but reading `t`'s solved P1 coefficients back as
-values at specific physical surface points isn't wired up yet. Since
-particles are emitted essentially at r = R, this matters for any real
-usage and is the natural next piece of this module.
+Coulomb-law integration of the solved surface charge over every mesh
+panel -- see `bem.laplace`/`bem.panel_field` for why this indirect/charge-
+simulation formulation was chosen over the mixed direct one). That's
+accurate close to the tip -- sub-percent error by r ~ 1.05R, a few percent
+by r ~ 1.01R -- but still not accurate *exactly* on the mesh surface
+(r = R exactly), where error is still of order 100%. The mesh is flat-
+faceted, not curved, so r = R (the analytic sphere's own surface) sits
+just barely *outside* the discretized geometry except at mesh vertices --
+a standoff that shrinks, rather than grows, under mesh refinement, so this
+isn't fixed by a finer mesh either. If exact on-surface accuracy is
+needed, the next things to try, in rough order of effort: (a) a dedicated
+near-singular quadrature transform (Telles' or the Johnston-Elliott sinh
+transform) in `bem.panel_field`, since the current adaptive-subdivision
+scheme plateaus rather than converging as the standoff shrinks; or (b) the
+closed-form jump relation for a single-layer potential's normal
+derivative, which decomposes the on-surface field into sigma/2 (known)
+plus the *weakly* singular (not hypersingular) adjoint-double-layer
+operator applied to sigma -- both already directly available from bempp,
+and this sidesteps near-panel quadrature for the on-surface case entirely.
+Neither is implemented yet. Since particles are emitted essentially at
+r = R, this matters for any real usage.
 """
 
 import numpy as np
@@ -87,9 +94,12 @@ class HemisphericalTipBEMField:
     n_theta, n_phi : int, optional
         Mesh resolution -- see `bem.mesh.sphere_mesh`.
     gmres_tol : float, optional
-        Relative residual tolerance for the boundary-integral GMRES solve.
+        Relative residual tolerance for the boundary-integral GMRES solve
+        (a first-kind system -- see `bem.laplace` -- so this solve is
+        noticeably slower than the direct formulation's was, though it
+        still converges fine at the resolutions tried so far).
     refine_ratio, max_depth : optional
-        Passed through to `bem.panel_field.evaluate_panel_field`.
+        Passed through to `bem.panel_field.evaluate_coulomb_field`.
     xp : module, optional
         Only used to shape/type the returned field array the same way
         `fields.HemisphericalTipField` does; the BEM solve itself always

@@ -1,45 +1,39 @@
 """Analytic (no finite differences) evaluation of the field from a solved
-boundary-element Laplace problem, by directly integrating the exact field
-kernel -- Coulomb's law for the single-layer (charge) term, the dipole
-field for the double-layer (potential) term -- over each flat triangular
-panel and its linearly-varying (P1) nodal data.
+*indirect* (charge-simulation-style) boundary-element Laplace problem: sum
+the exact Coulomb field of a linearly-varying (P1) surface charge density
+directly over every flat triangular panel.
 
-This replaces getting the field by finite-differencing the potential:
-differencing right next to or on a panel is a classic hard case for BEM
-(the potential itself is only mesh/quadrature-accurate, and differencing
-amplifies that error close to the surface). Integrating the field kernel
-directly avoids that, at the cost of the field kernel's own, stronger
-(1/r^2 rather than potential's 1/r) near-panel singularity -- handled here
-with simple adaptive quadrature: a panel is recursively subdivided (in
-barycentric coordinates, so the original nodal data always interpolates
+`bem.laplace.ExteriorLaplaceSolution` solves for a single unknown surface
+density sigma such that its single-layer potential S[sigma] matches the
+required Dirichlet data on the boundary -- the indirect/charge-simulation
+formulation, as opposed to the direct formulation (solve for both a
+Dirichlet and a Neumann trace, reconstruct the field from S[t] - D[g]).
+The direct formulation's field requires the *gradient* of the double-layer
+potential, a hypersingular (~1/r^3) kernel: numerically brutal close to a
+panel (this project's earlier attempt got *worse*, not better, under mesh
+refinement, since refining tracks a fixed evaluation point ever closer to
+the increasingly accurate faceted surface -- see git history for the
+finite-difference and direct-panel-quadrature attempts this replaced).
+Indirect/CSM sidesteps that kernel entirely: the only integral needed here
+is the Coulomb field of sigma, which is one order milder (~1/r^2) and is
+the same kernel this project's single-layer term already validated
+cleanly. Physically, unlike the hypersingular case, a real charge sheet's
+field has a well-understood jump right at the surface (E_normal jumps by
+sigma/epsilon0) rather than a numerical blow-up -- this is the standard
+technique (also called the surface charge simulation method) used in
+high-voltage/field-emission engineering for exactly this kind of
+near-electrode field calculation.
+
+The remaining difficulty is only the ordinary near-panel one: adaptive
+quadrature, same idea as before -- a panel is recursively subdivided (in
+barycentric coordinates, so the linear nodal data always interpolates
 correctly on every sub-panel, no re-fitting needed) until each piece is
 either far enough from the evaluation point relative to its own size, or a
-maximum recursion depth is hit. The depth cap means a point sitting right
-on a panel gets a large but bounded answer (reflecting the mesh's own
-resolution limit) rather than a literal singularity -- a reasonable,
-physically sensible regularization, and a deliberately simple alternative
-to deriving closed-form linearly-varying-panel formulas.
-
-The double-layer term needs one more trick, and adaptive subdivision alone
-isn't it: D[g](x) = integral of g(y) K(x,y) dA(y) over a *closed* surface
-is exactly a spatially constant function of x throughout the whole
-exterior (0, by the standard solid-angle identity) whenever g is uniform,
-so its gradient (the double-layer's contribution to the field) must be
-*exactly* zero there, not just small. Numerically this identity only
-emerges from a delicate cancellation across the *entire* surface, and
-per-panel quadrature (however refined near x) converges to it far too
-slowly to be usable -- confirmed here by testing a uniform g directly,
-which should give an exactly-zero field outside any closed surface but
-came back with an order-1 (relative to the real Ez*R data this module
-actually sees) spurious value even with deep per-panel refinement. The
-standard fix is to subtract a constant reference value g_ref from g before
-integrating: since the integral of K(x,y) dA(y) over the whole surface is
-exactly 0 (exterior) regardless of what g_ref is, D[g](x) = D[g - g_ref](x)
-identically, but the integrand on the right is now small exactly where the
-kernel is largest (near x's closest surface point) if g_ref is g's value
-there -- that's what actually fixes the convergence, not a change in the
-true answer. `evaluate_panel_field` takes g_ref, per evaluation point, as
-the Dirichlet value at the nearest mesh vertex.
+maximum recursion depth is hit. If this project ever needs field accuracy
+literally on the mesh (not just close to it) and this adaptive scheme
+isn't enough, the standard next step is a dedicated near-singular
+quadrature transform (e.g. Telles' or the Johnston-Elliott sinh
+transform) rather than switching formulations again.
 
 This is also exactly the machinery a future image-charge force calculation
 will need: particles interacting with the recessed image surface are
@@ -81,21 +75,11 @@ def _area_fraction(b0, b1, b2):
     return abs(d1[0] * d2[1] - d1[1] * d2[0])
 
 
-def _panel_field(x, v0, v1, v2, g0, g1, g2, t0, t1, t2, normal, area, refine_ratio, max_depth):
-    """Adaptive-quadrature field contribution from one flat triangular
-    panel (corners v0,v1,v2; Dirichlet data g and Neumann data t linearly
-    interpolated from those corners' nodal values) to the perturbation
-    field at point x.
-
-    Representation formula phi_pert(x) = S[t](x) - D[g](x) gives
-    E_pert(x) = -grad phi_pert(x), i.e. a Coulomb-law contribution from t
-    and a dipole-field contribution from g (dipole moment density along
-    the panel's outward normal), both summed here directly.
-
-    `g0, g1, g2` must already be shifted by a reference value (see
-    `evaluate_panel_field`) -- the double-layer kernel's gradient, unlike
-    the single-layer's, needs this to converge at any reasonable
-    resolution (see the module docstring).
+def _panel_coulomb_field(x, v0, v1, v2, s0, s1, s2, area, refine_ratio, max_depth):
+    """Adaptive-quadrature Coulomb-field contribution from one flat
+    triangular panel (corners v0,v1,v2; surface charge density sigma
+    linearly interpolated from those corners' nodal values s0,s1,s2) to
+    the perturbation field at point x.
     """
     E = np.zeros(3)
     stack = [(_ROOT_BARY, 0)]
@@ -117,35 +101,30 @@ def _panel_field(x, v0, v1, v2, g0, g1, g2, t0, t1, t2, normal, area, refine_rat
         for bary_weights, weight in zip(_QUAD_BARY, _QUAD_WEIGHTS):
             bary = bary_weights[0] * b0 + bary_weights[1] * b1 + bary_weights[2] * b2
             pos = bary[0] * v0 + bary[1] * v1 + bary[2] * v2
-            g_val = bary[0] * g0 + bary[1] * g1 + bary[2] * g2
-            t_val = bary[0] * t0 + bary[1] * t1 + bary[2] * t2
+            s_val = bary[0] * s0 + bary[1] * s1 + bary[2] * s2
 
             r_vec = x - pos
             r = np.linalg.norm(r_vec)
-            r_hat = r_vec / r
 
-            e_single = t_val * r_vec / r**3
-            e_double = g_val * (3.0 * np.dot(normal, r_hat) * r_hat - normal) / r**3
-
-            E += (weight * sub_area / (4.0 * np.pi)) * (e_single + e_double)
+            E += (weight * sub_area / (4.0 * np.pi)) * s_val * r_vec / r**3
 
     return E
 
 
-def evaluate_panel_field(vertices, elements, g_nodal, t_nodal, points, refine_ratio=1.0, max_depth=6):
-    """The perturbation field E_pert(x) = -grad[S[t] - D[g]](x) at `points`,
-    by direct adaptive-quadrature integration of the field kernels over
-    every mesh panel (see module docstring) -- no finite differences.
+def evaluate_coulomb_field(vertices, elements, sigma_nodal, points, refine_ratio=1.0, max_depth=6):
+    """The field E(x) = -grad[S[sigma]](x) at `points`, by direct adaptive-
+    quadrature integration of the Coulomb kernel over every mesh panel
+    (see module docstring) -- no finite differences.
 
     Parameters
     ----------
     vertices, elements : the mesh, BEMpp convention (see bem.mesh) -- note
         that for the P1 spaces used throughout this project, DOF index i
         corresponds exactly to `vertices[:, i]` (verified against BEMpp's
-        `space.cell_dofs`), so `g_nodal`/`t_nodal` below can be taken
-        directly from `GridFunction.coefficients`.
-    g_nodal, t_nodal : ndarray, shape (n_vertices,)
-        Dirichlet and Neumann nodal values at each vertex.
+        `space.cell_dofs`), so `sigma_nodal` below can be taken directly
+        from `GridFunction.coefficients`.
+    sigma_nodal : ndarray, shape (n_vertices,)
+        Solved surface-charge-density nodal values at each vertex.
     points : ndarray, shape (..., 3)
     refine_ratio : float
         A sub-panel is refined further while its size exceeds
@@ -170,30 +149,15 @@ def evaluate_panel_field(vertices, elements, g_nodal, t_nodal, points, refine_ra
     panels = []
     for i0, i1, i2 in elements.T:
         v0, v1, v2 = v[i0], v[i1], v[i2]
-        # -cross(...): this project's revolve_profile winds triangles so
-        # that -cross(v1-v0, v2-v0) is the outward normal (checked against
-        # the sphere case, where "outward" unambiguously means away from
-        # the center).
         raw_normal = -np.cross(v1 - v0, v2 - v0)
         area = 0.5 * np.linalg.norm(raw_normal)
-        normal = raw_normal / (2.0 * area)
-        panels.append(
-            (v0, v1, v2, g_nodal[i0], g_nodal[i1], g_nodal[i2], t_nodal[i0], t_nodal[i1], t_nodal[i2], normal, area)
-        )
+        panels.append((v0, v1, v2, sigma_nodal[i0], sigma_nodal[i1], sigma_nodal[i2], area))
 
     result = np.empty((flat_points.shape[0], 3))
     for i, x in enumerate(flat_points):
-        # Desingularize the double-layer term (see module docstring): shift
-        # g by its value at the mesh vertex nearest x, which leaves the
-        # true field unchanged but makes the near-panel integrand small
-        # exactly where the kernel is largest.
-        g_ref = g_nodal[np.argmin(np.sum((v - x) ** 2, axis=-1))]
-
         E = np.zeros(3)
-        for v0, v1, v2, g0, g1, g2, t0, t1, t2, normal, area in panels:
-            E += _panel_field(
-                x, v0, v1, v2, g0 - g_ref, g1 - g_ref, g2 - g_ref, t0, t1, t2, normal, area, refine_ratio, max_depth
-            )
+        for v0, v1, v2, s0, s1, s2, area in panels:
+            E += _panel_coulomb_field(x, v0, v1, v2, s0, s1, s2, area, refine_ratio, max_depth)
         result[i] = E
 
     return result.reshape(shape)

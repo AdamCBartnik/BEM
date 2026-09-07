@@ -56,10 +56,13 @@ def test_hemispherical_tip_bem_field_matches_analytic_field_off_surface():
 
 
 def test_hemispherical_tip_bem_field_matches_analytic_field_near_surface():
-    """The point of computing the field via direct panel-kernel integration
-    (bem.panel_field) rather than finite-differencing the potential is
-    accuracy close to the tip, where particles are actually emitted -- this
-    should hold up within a few percent of R, not just far away."""
+    """The point of the indirect/charge-simulation formulation (bem.laplace,
+    bem.panel_field) rather than the direct one is accuracy close to the
+    tip, where particles are actually emitted -- this should hold up
+    within a percent of R, not just far away. (Exactly at r=R itself is
+    still inaccurate -- see bem.fields' module docstring -- because the
+    flat-faceted mesh sits just barely outside the analytic sphere there,
+    a standoff that shrinks rather than grows under mesh refinement.)"""
     R = 50e-9
     Ez = -1e8
 
@@ -67,13 +70,18 @@ def test_hemispherical_tip_bem_field_matches_analytic_field_near_surface():
     analytic_field = HemisphericalTipField(Ez, R)
 
     theta = np.array([0.0, 0.3, 0.9, 1.4])
-    points = _valid_hemisphere_points(theta, r=1.05 * R)
 
-    E_bem = bem_field.evaluate(points)
-    E_analytic = analytic_field.evaluate(points)
+    points_1p05R = _valid_hemisphere_points(theta, r=1.05 * R)
+    rel_err_1p05R = np.linalg.norm(
+        bem_field.evaluate(points_1p05R) - analytic_field.evaluate(points_1p05R), axis=-1
+    ) / np.abs(Ez)
+    assert np.max(rel_err_1p05R) < 1e-2
 
-    rel_err = np.linalg.norm(E_bem - E_analytic, axis=-1) / np.abs(Ez)
-    assert np.max(rel_err) < 1e-2
+    points_1p01R = _valid_hemisphere_points(theta, r=1.01 * R)
+    rel_err_1p01R = np.linalg.norm(
+        bem_field.evaluate(points_1p01R) - analytic_field.evaluate(points_1p01R), axis=-1
+    ) / np.abs(Ez)
+    assert np.max(rel_err_1p01R) < 0.05
 
 
 def test_hemispherical_tip_bem_field_is_zero_inside_the_conductor():
