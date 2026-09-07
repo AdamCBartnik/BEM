@@ -51,6 +51,16 @@ def torus_fillet_profile(major_radius, tube_radius, phi_start, phi_end, n_phi):
     return np.column_stack([r, z])
 
 
+def sphere_profile(radius, n_theta):
+    """Profile of a full closed sphere, pole to pole (theta: 0 to pi)."""
+    return sphere_cap_profile(radius, n_theta, theta_max=np.pi)
+
+
+def sphere_mesh(radius, n_theta=40, n_phi=48):
+    """Triangulated mesh of a full closed sphere."""
+    return revolve_profile(sphere_profile(radius, n_theta), n_phi)
+
+
 def hemisphere_tip_real_profile(R, plane_radius, n_theta=40, n_r=40):
     """Generating profile of the real (physical) hemisphere-on-plane
     conductor surface: sphere cap of radius R, then the surrounding plane

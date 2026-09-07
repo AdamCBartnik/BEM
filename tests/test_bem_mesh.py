@@ -8,6 +8,7 @@ from specific_particle_tracer.bem.mesh import (
     hemisphere_tip_image_mesh,
     min_distance_to_profile,
     revolve_profile,
+    sphere_mesh,
 )
 
 
@@ -98,3 +99,19 @@ def test_hemisphere_tip_meshes_have_matching_azimuthal_resolution():
     cap_mask = image_v[2] > 0
     r_cap = np.linalg.norm(image_v[:, cap_mask], axis=0)
     assert np.allclose(r_cap, R - z0, rtol=1e-9)
+
+
+def test_sphere_mesh_is_closed_and_all_vertices_lie_on_the_sphere():
+    R = 50e-9
+    vertices, elements = sphere_mesh(R, n_theta=20, n_phi=24)
+
+    assert elements.min() >= 0
+    assert elements.max() < vertices.shape[1]
+    assert np.allclose(np.linalg.norm(vertices, axis=0), R, rtol=1e-9)
+
+    edge_counts = {}
+    for tri in elements.T:
+        for i in range(3):
+            edge = tuple(sorted((tri[i], tri[(i + 1) % 3])))
+            edge_counts[edge] = edge_counts.get(edge, 0) + 1
+    assert set(edge_counts.values()) == {2}
