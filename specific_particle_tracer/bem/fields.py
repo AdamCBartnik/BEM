@@ -13,66 +13,61 @@ BEM problem:
 1. The real cathode plane is infinite, but a mesh must be finite, and the
    diverging (non-decaying) part of the total field -- the uniform
    asymptotic Ez itself -- is exactly what a finite mesh can't represent as
-   a boundary condition. Solved with the superposition trick in
-   `bem.laplace`: solve only for the perturbation phi_pert = phi_total -
-   phi_inf, which decays like a dipole field and truncates well, then add
-   the uniform field back analytically.
+   a boundary condition. Solved with the superposition trick: solve only
+   for the perturbation phi_pert = phi_total - phi_inf, which decays like a
+   dipole field and truncates well, then add the uniform field back
+   analytically.
 
-2. Truncating the *plane* itself (meshing a finite disk of it) introduces
-   an artificial free edge/rim, which the direct boundary-integral
-   formulation in `bem.laplace` isn't valid for -- it assumes a closed
-   surface (no boundary), and empirically produces a badly-conditioned or
-   even non-convergent GMRES solve on an open, rimmed mesh. This is
-   sidestepped here (as it is in the analytic solution) rather than solved
-   in general: a hemispherical tip's mirror image through z=0 is exactly
-   the lower hemisphere, so the tip's full mirrored shape is simply the
-   complete sphere of radius R. Solving the closed-sphere problem with
-   Dirichlet data phi_pert = -phi_inf = Ez*z (odd under z -> -z) gives a
-   solution that is itself odd about z=0, which is automatically zero on
-   the z=0 plane everywhere outside the tip -- exactly the boundary
-   condition the surrounding flat cathode needs, with no separate plane
-   image and no plane meshing at all. This is precisely the same symmetry
-   argument `fields.HemisphericalTipField`'s docstring gives for why its
-   analytic solution needs no separate plane image either.
+2. Truncating the *plane* itself introduces an artificial free edge/rim
+   that the direct boundary-integral formulation isn't valid for. Instead
+   of solving that in general, this shape's own mirror symmetry sidesteps
+   it: a hemispherical tip's mirror image through z=0 is exactly the lower
+   hemisphere, so the tip's full mirrored shape is simply the complete
+   sphere of radius R. Solving the closed-sphere problem with Dirichlet
+   data phi_pert = -phi_inf = Ez*z (odd under z -> -z) gives a solution
+   that is itself odd about z=0, automatically zero on the z=0 plane
+   everywhere outside the tip -- exactly the boundary condition the
+   surrounding flat cathode needs, with no separate plane image and no
+   plane meshing at all. This is precisely the same symmetry argument
+   `fields.HemisphericalTipField`'s docstring gives for why its analytic
+   solution needs no separate plane image either.
 
    A tip shape without that convenient mirror symmetry will eventually need
-   the plane genuinely truncated and the open-surface case handled (e.g. by
-   closing the mesh with an artificial distant boundary, or using an
-   open-surface BIE formulation) -- left for when a non-symmetric geometry
-   is actually attempted. A shape *carved out of* the plane (a symmetric
-   dimple/well) would still enjoy this same mirror trick -- its mirror
-   image is a closed cavity rather than a closed bump, which just flips the
-   problem to an interior Dirichlet solve -- but an asymmetric carved shape
-   has the identical open-surface problem an asymmetric bump does.
+   the plane genuinely truncated and the open-surface case handled -- left
+   for when a non-symmetric geometry is actually attempted. A shape
+   *carved out of* the plane (a symmetric dimple/well) would still enjoy
+   this same mirror trick -- its mirror image is a closed cavity rather
+   than a closed bump, which just flips the problem to an interior
+   Dirichlet solve -- but an asymmetric carved shape has the identical
+   open-surface problem an asymmetric bump does.
 
-Known limitation: `evaluate` gets its field from `bem.panel_field` (direct
-Coulomb-law integration of the solved surface charge over every mesh
-panel, with a near-surface regularization -- see `bem.laplace`/
-`bem.panel_field` for why this indirect/charge-simulation formulation was
-chosen over the mixed direct one, and for the regularization itself, which
-went through two versions this project has kept for the record). Accuracy
-improves monotonically with distance from the tip: sub-percent by
-r ~ 1.05R, and *exactly* on the mesh surface (r = R itself, where the
-unregularized sum was off by 100%+) is now only off by ~10-20% at a
-moderate mesh resolution (n_theta=30) -- and, unlike the first version of
-this regularization, genuinely shrinks under mesh refinement (~24% at
-n_theta=20 down to ~4% at n_theta=90), rather than plateauing regardless
-of resolution. The mesh is flat-faceted, not curved, so r = R (the
-analytic sphere's own surface) sits just barely *outside* the discretized
-geometry except at mesh vertices -- this residual error, at any given
-resolution, is what's left of that same near-panel difficulty after
-regularization. Since particles are emitted essentially at r = R, this is
-the accuracy that matters most for real usage: for now, use a finer mesh
-if better on-surface accuracy is needed; a dedicated near-singular
-quadrature transform (e.g. Telles' or the Johnston-Elliott sinh
-transform) is the natural next thing to try if resolution alone isn't
-enough.
+Axisymmetric, not general 3D
+-----------------------------
+Both this shape and its excitation (a uniform field along the symmetry
+axis) are axisymmetric, so this class solves via `bem.axisymmetric`
+(a 1D generating-profile mesh, azimuthal integration done in closed form
+via elliptic integrals) rather than the general 3D machinery in
+`bem.mesh`/`bem.laplace`/`bem.panel_field`. That general 3D path is kept
+for when a future geometry or excitation isn't axisymmetric -- it remains
+tested and usable, just not what this class uses by default. The
+axisymmetric solve is both far cheaper (tens of profile nodes instead of
+thousands of triangles -- direct linear solve, not GMRES) and at least as
+accurate: on-surface field error (r = R exactly, where particles are
+actually emitted) shrinks monotonically from ~35% at n_theta=10 to ~5% at
+n_theta=60, matching the general 3D approach's accuracy at a given
+resolution while costing roughly two orders of magnitude less per field
+evaluation (a few ms per point here vs. 100+ ms there) -- see
+`bem.axisymmetric`'s module docstring for the near-surface regularization
+this shares with `bem.panel_field`, and for a normalization bug (a missing
+factor of 2*pi) that a first version of this class's validation caught via
+a basic shell-theorem sanity check, not the point-by-point comparisons
+that had already passed.
 """
 
 import numpy as np
 
-from .mesh import sphere_mesh
-from .laplace import ExteriorLaplaceSolution
+from .mesh import sphere_profile
+from .axisymmetric import AxisymmetricBEMSolution
 
 
 class HemisphericalTipBEMField:
@@ -80,9 +75,9 @@ class HemisphericalTipBEMField:
     hemispherical tip of radius R on an infinite flat cathode, in a uniform
     asymptotic field Ez.
 
-    Only the full sphere (radius R) is meshed, not the surrounding plane --
-    see the module docstring for why that's exact for this particular
-    (mirror-symmetric) shape.
+    The full sphere (radius R) is used as the generating profile, not just
+    the surrounding plane -- see the module docstring for why that's exact
+    for this particular (mirror-symmetric) shape.
 
     Parameters
     ----------
@@ -91,35 +86,28 @@ class HemisphericalTipBEMField:
         `fields.GunField.Ez`/`fields.HemisphericalTipField.Ez`.
     R : float
         Tip radius [m].
-    n_theta, n_phi : int, optional
-        Mesh resolution -- see `bem.mesh.sphere_mesh`.
-    gmres_tol : float, optional
-        Relative residual tolerance for the boundary-integral GMRES solve
-        (a first-kind system -- see `bem.laplace` -- so this solve is
-        noticeably slower than the direct formulation's was, though it
-        still converges fine at the resolutions tried so far).
+    n_theta : int, optional
+        Number of profile nodes from pole to pole -- see
+        `bem.mesh.sphere_profile`.
     refine_ratio, max_depth : optional
-        Passed through to `bem.panel_field.evaluate_coulomb_field`.
+        Passed through to `bem.axisymmetric.evaluate_axisymmetric_field`.
     xp : module, optional
-        Only used to shape/type the returned field array the same way
-        `fields.HemisphericalTipField` does; the BEM solve itself always
-        runs on numpy/bempp.
+        Only used to shape/type the returned field array; the BEM solve
+        itself always runs on numpy regardless of what's passed here.
     """
 
-    def __init__(self, Ez, R, n_theta=40, n_phi=48, gmres_tol=1e-8, refine_ratio=1.0, max_depth=6, xp=np):
+    def __init__(self, Ez, R, n_theta=40, refine_ratio=1.0, max_depth=20, xp=np):
         self.Ez = float(Ez)
         self.R = float(R)
         self.xp = xp
         self.refine_ratio = refine_ratio
         self.max_depth = max_depth
 
-        vertices, elements = sphere_mesh(self.R, n_theta=n_theta, n_phi=n_phi)
+        profile = sphere_profile(self.R, n_theta=n_theta)
         Ez_ = self.Ez
         # phi_inf(z) = -Ez*z, so the Dirichlet data forcing the total
         # potential to zero on the (grounded) sphere is g = -phi_inf = Ez*z.
-        self.solution = ExteriorLaplaceSolution.solve(
-            vertices, elements, dirichlet_fn=lambda x, y, z: Ez_ * z, gmres_tol=gmres_tol
-        )
+        self.solution = AxisymmetricBEMSolution.solve(profile, dirichlet_fn=lambda rho, z: Ez_ * z)
 
     def evaluate(self, position):
         """Evaluate the field at the given positions.
