@@ -27,6 +27,13 @@ def test_exterior_dirichlet_solve_matches_grounded_sphere_in_uniform_field():
     assert np.max(np.abs(phi_bem - phi_analytic)) / np.abs(E0 * a) < 1e-2
 
 
+def _valid_hemisphere_points(theta, r):
+    """theta measured from the pole; only theta < pi/2 (z > 0) is physical
+    for HemisphericalTipField, so keep tests off the mirrored lower half of
+    the full-sphere mesh HemisphericalTipBEMField actually solves on."""
+    return np.column_stack([r * np.sin(theta), np.zeros_like(theta), r * np.cos(theta)])
+
+
 def test_hemispherical_tip_bem_field_matches_analytic_field_off_surface():
     """Away from the tip surface, the BEM field (real geometry + uniform-
     field superposition trick + full-sphere mirror-symmetry trick, see
@@ -35,12 +42,32 @@ def test_hemispherical_tip_bem_field_matches_analytic_field_off_surface():
     R = 50e-9
     Ez = -1e8
 
-    bem_field = HemisphericalTipBEMField(Ez, R, n_theta=30, n_phi=36, fd_step=1e-3 * R)
+    bem_field = HemisphericalTipBEMField(Ez, R, n_theta=30, n_phi=36)
     analytic_field = HemisphericalTipField(Ez, R)
 
-    theta = np.array([0.0, 0.3, 0.9, 1.5, 2.5, np.pi - 0.05])
-    r = 3.0 * R
-    points = np.column_stack([r * np.sin(theta), np.zeros_like(theta), r * np.cos(theta)])
+    theta = np.array([0.0, 0.3, 0.9, 1.4])
+    points = _valid_hemisphere_points(theta, r=3.0 * R)
+
+    E_bem = bem_field.evaluate(points)
+    E_analytic = analytic_field.evaluate(points)
+
+    rel_err = np.linalg.norm(E_bem - E_analytic, axis=-1) / np.abs(Ez)
+    assert np.max(rel_err) < 1e-2
+
+
+def test_hemispherical_tip_bem_field_matches_analytic_field_near_surface():
+    """The point of computing the field via direct panel-kernel integration
+    (bem.panel_field) rather than finite-differencing the potential is
+    accuracy close to the tip, where particles are actually emitted -- this
+    should hold up within a few percent of R, not just far away."""
+    R = 50e-9
+    Ez = -1e8
+
+    bem_field = HemisphericalTipBEMField(Ez, R, n_theta=30, n_phi=36)
+    analytic_field = HemisphericalTipField(Ez, R)
+
+    theta = np.array([0.0, 0.3, 0.9, 1.4])
+    points = _valid_hemisphere_points(theta, r=1.05 * R)
 
     E_bem = bem_field.evaluate(points)
     E_analytic = analytic_field.evaluate(points)

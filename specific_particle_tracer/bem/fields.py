@@ -45,23 +45,21 @@ BEM problem:
    problem to an interior Dirichlet solve -- but an asymmetric carved shape
    has the identical open-surface problem an asymmetric bump does.
 
-Known limitation: `evaluate` is only validated (against
-`fields.HemisphericalTipField`) away from the tip surface -- error is a
-fraction of a percent by r ~ 3R and shrinks further with mesh resolution,
-but grows to tens of percent right at r ~ R. That's because `evaluate` gets
-the field by finite-differencing the *potential*, and finite-differencing
-right next to (or on) a boundary element is a well-known hard case for BEM
-(near-singular quadrature) -- the potential itself is only resolved to
-mesh/quadrature accuracy, and differencing amplifies that error close to
-the surface. The right fix is to read the field directly off the already-
-solved surface charge (Neumann trace) instead of differencing the
-potential -- on a grounded conductor the field is purely normal, with
-magnitude set by the surface charge density -- but that requires correctly
-mapping the solved Neumann `GridFunction`'s DOF coefficients back to
-physical surface points (its coefficients are not simply per-input-vertex
-values), which isn't done yet. Since particles are emitted essentially at
-r = R, this matters for any real usage and is the natural next piece of
-this module, not yet attempted.
+Known limitation: `evaluate` gets its field from `bem.panel_field` (direct
+analytic integration of the field kernel over every mesh panel -- see that
+module for why, and for the desingularization trick that makes the
+double-layer term converge at all). That is accurate close to the tip --
+sub-percent error by r ~ 1.05R, not just far away -- but not *exactly* on
+the mesh surface (r = R exactly), where error is still tens of percent and
+barely improves with deeper adaptive subdivision. That's because the
+exterior representation formula panel_field implements is only valid off
+the surface; the correct on-surface formula is the trivial one instead --
+a grounded conductor's surface field is purely normal, set directly by the
+already-solved surface charge (Neumann trace) `t`, no potential or its
+gradient needed at all -- but reading `t`'s solved P1 coefficients back as
+values at specific physical surface points isn't wired up yet. Since
+particles are emitted essentially at r = R, this matters for any real
+usage and is the natural next piece of this module.
 """
 
 import numpy as np
@@ -90,25 +88,20 @@ class HemisphericalTipBEMField:
         Mesh resolution -- see `bem.mesh.sphere_mesh`.
     gmres_tol : float, optional
         Relative residual tolerance for the boundary-integral GMRES solve.
-    fd_step : float or None, optional
-        Finite-difference step [m] used to get the field from the solved
-        potential (see `ExteriorLaplaceSolution.field`). Default 1e-3 * R,
-        picked empirically: small enough to resolve the field's curvature,
-        large enough that the difference isn't swamped by the BEM solve's
-        own (mesh- and quadrature-limited) potential error -- see the
-        module docstring's near-surface caveat, which this step size does
-        not fix.
+    refine_ratio, max_depth : optional
+        Passed through to `bem.panel_field.evaluate_panel_field`.
     xp : module, optional
         Only used to shape/type the returned field array the same way
         `fields.HemisphericalTipField` does; the BEM solve itself always
         runs on numpy/bempp.
     """
 
-    def __init__(self, Ez, R, n_theta=40, n_phi=48, gmres_tol=1e-8, fd_step=None, xp=np):
+    def __init__(self, Ez, R, n_theta=40, n_phi=48, gmres_tol=1e-8, refine_ratio=1.0, max_depth=6, xp=np):
         self.Ez = float(Ez)
         self.R = float(R)
         self.xp = xp
-        self.fd_step = fd_step if fd_step is not None else 1e-3 * self.R
+        self.refine_ratio = refine_ratio
+        self.max_depth = max_depth
 
         vertices, elements = sphere_mesh(self.R, n_theta=n_theta, n_phi=n_phi)
         Ez_ = self.Ez
@@ -139,7 +132,7 @@ class HemisphericalTipBEMField:
         E_uniform = np.zeros_like(position)
         E_uniform[..., 2] = self.Ez
 
-        E_pert = self.solution.field(position, self.fd_step)
+        E_pert = self.solution.field(position, refine_ratio=self.refine_ratio, max_depth=self.max_depth)
 
         E = E_uniform + E_pert
         E = np.where(valid[..., None], E, 0.0)

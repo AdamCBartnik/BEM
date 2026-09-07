@@ -19,6 +19,8 @@ hemisphere-tip application of this.
 import numpy as np
 import bempp_cl.api as bempp_api
 
+from .panel_field import evaluate_panel_field
+
 
 class ExteriorLaplaceSolution:
     """The solution (Dirichlet + solved Neumann data) of an exterior Laplace
@@ -90,37 +92,33 @@ class ExteriorLaplaceSolution:
         phi = (slp_pot * self.neumann_fun - dlp_pot * self.dirichlet_fun).ravel()
         return phi.reshape(shape)
 
-    def field(self, points, fd_step):
-        """Perturbation field E_pert = -grad(phi_pert) at `points`, via
-        central finite differences with step `fd_step` [m].
+    def field(self, points, refine_ratio=1.0, max_depth=6):
+        """Perturbation field E_pert = -grad(phi_pert) at `points`, by
+        direct adaptive-quadrature integration of the field kernel over
+        every mesh panel -- see `bem.panel_field` for why (no finite
+        differences: differencing the potential right next to or on a
+        panel is a classic hard case for BEM, and this project's own
+        earlier attempt at it confirmed as much).
 
-        BEMpp's potential operators only give the potential itself, not its
-        gradient, so this evaluates all 6 stencil offsets (for all points
-        at once, to amortize potential-operator assembly) rather than
-        differentiating analytically.
+        DOF index i corresponds exactly to `vertices[:, i]` for the P1
+        spaces used throughout this project (checked against BEMpp's
+        `space.cell_dofs`), so `GridFunction.coefficients` can be used
+        directly as nodal values.
 
         Parameters
         ----------
         points : ndarray, shape (..., 3)
-        fd_step : float
+        refine_ratio, max_depth : see `panel_field.evaluate_panel_field`.
 
         Returns
         -------
-        E : ndarray, same shape as `points`.
+        E : ndarray, same shape as `points`. Not accurate for a point
+            sitting exactly on the mesh surface -- see `panel_field`'s
+            module docstring.
         """
-        points = np.asarray(points, dtype=float)
-        shape = points.shape
-        flat = points.reshape(-1, 3)
-        n = flat.shape[0]
-
-        stacked = np.tile(flat, (6, 1))
-        for axis in range(3):
-            stacked[2 * axis * n : (2 * axis + 1) * n, axis] += fd_step
-            stacked[(2 * axis + 1) * n : (2 * axis + 2) * n, axis] -= fd_step
-
-        phi = self.potential(stacked).reshape(6, n)
-        grad = np.empty((n, 3))
-        for axis in range(3):
-            grad[:, axis] = (phi[2 * axis] - phi[2 * axis + 1]) / (2.0 * fd_step)
-
-        return (-grad).reshape(shape)
+        grid = self.space.grid
+        g_nodal = np.real(self.dirichlet_fun.coefficients)
+        t_nodal = np.real(self.neumann_fun.coefficients)
+        return evaluate_panel_field(
+            grid.vertices, grid.elements, g_nodal, t_nodal, points, refine_ratio=refine_ratio, max_depth=max_depth
+        )

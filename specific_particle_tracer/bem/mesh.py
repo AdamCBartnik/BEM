@@ -119,7 +119,7 @@ def revolve_profile(profile_rz, n_phi, pole_tol=1e-12):
             a, b = ring_a[k], ring_a[(k + 1) % n_phi]
             c, d = ring_b[k], ring_b[(k + 1) % n_phi]
             if a == b:  # ring i is a pole
-                elements.append((a, c, d))
+                elements.append((a, d, c))
             elif c == d:  # ring i+1 is a pole
                 elements.append((a, b, c))
             else:
