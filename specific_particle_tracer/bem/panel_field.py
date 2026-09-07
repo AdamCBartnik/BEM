@@ -37,20 +37,32 @@ refinement should help.
 The fix is the same idea as the (now-removed) direct formulation's
 double-layer desingularization, adapted to a kernel that does not have an
 identically-zero reference case to exploit: shift the density by a local
-reference value sigma_ref (sigma at the nearest mesh vertex to x) before
-summing, so the integrand vanishes right where the kernel is largest, and
-add back the *exact* contribution the shifted-away reference density
-would have contributed. That contribution is the single-layer jump
-relation for a uniform-density surface patch, well known in electrostatics
-as the field of an (locally-idealized) infinite charged sheet: sigma_ref *
-n(x), n(x) the local outward normal (from `bem.mesh.vertex_normals`) --
-notably independent of standoff distance, which is exactly why this fixes
-both the exactly-on-vertex and the more common "close to, but not quite
-on, a panel" case in one step. Verified against the analytic hemisphere
-solution: this converges cleanly (unlike the unregularized sum) and
-reduces on-mesh-vertex error from ~100% to a fraction of a percent, and
-generic (non-vertex) points at the analytic surface radius from ~100% to a
-few percent.
+reference value sigma_ref before summing, so the integrand vanishes right
+where the kernel is largest, and add back the *exact* contribution the
+shifted-away reference density would have contributed. That contribution
+is the single-layer jump relation for a uniform-density surface patch,
+well known in electrostatics as the field of an (locally-idealized)
+infinite charged sheet: sigma_ref * n(x) -- notably independent of
+standoff distance, which is exactly why this fixes both the exactly-on-
+vertex and the more common "close to, but not quite on, a panel" case in
+one step.
+
+sigma_ref and n(x) themselves are taken at the point closest to x on the
+*whole mesh* (found by an exact point-to-triangle projection against
+every panel, then interpolated with that panel's own barycentric
+coordinates) rather than at the nearest vertex -- using the nearest vertex
+instead was tried first and left a stubborn, non-shrinking ~10-25% error
+at the analytic surface that didn't converge cleanly under mesh
+refinement (a vertex can sit a nontrivial fraction of an element size away
+from x's true closest point, and the resulting mismatch in both sigma_ref
+and the reference patch's own normal doesn't vanish as the mesh refines,
+since -- as bem.fields' module docstring notes -- the analytic surface's
+standoff from the mesh shrinks right along with the element size). Using
+the true closest point and that panel's own exact (not vertex-averaged)
+normal fixed this: verified against the analytic hemisphere solution,
+error at the analytic surface now shrinks monotonically with mesh
+resolution (why the vertex approach didn't converge cleanly should have
+been the first clue it wasn't using enough local information).
 
 This is also exactly the machinery a future image-charge force calculation
 will need: particles interacting with the recessed image surface are
@@ -58,8 +70,6 @@ always evaluated close to it, the same near-panel regime handled here.
 """
 
 import numpy as np
-
-from .mesh import vertex_normals
 
 # 3-point, degree-2-exact symmetric quadrature rule on the reference
 # triangle, in barycentric coordinates. Weights sum to 1 (so a panel's
@@ -92,6 +102,56 @@ def _area_fraction(b0, b1, b2):
     d1 = b1[:2] - b0[:2]
     d2 = b2[:2] - b0[:2]
     return abs(d1[0] * d2[1] - d1[1] * d2[0])
+
+
+def _closest_point_on_triangle(p, a, b, c):
+    """The point on flat triangle abc closest to p, and its barycentric
+    coordinates there (u, v, w), u+v+w=1, closest = u*a + v*b + w*c.
+
+    Standard region-based algorithm (Ericson, "Real-Time Collision
+    Detection", ch. 5): identify which of the triangle's 7 Voronoi regions
+    (3 vertices, 3 edges, the face) p projects into, and place the answer
+    there directly -- exact, and cheap (a handful of dot products).
+    """
+    ab = b - a
+    ac = c - a
+    ap = p - a
+    d1 = np.dot(ab, ap)
+    d2 = np.dot(ac, ap)
+    if d1 <= 0.0 and d2 <= 0.0:
+        return a, (1.0, 0.0, 0.0)
+
+    bp = p - b
+    d3 = np.dot(ab, bp)
+    d4 = np.dot(ac, bp)
+    if d3 >= 0.0 and d4 <= d3:
+        return b, (0.0, 1.0, 0.0)
+
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+        v = d1 / (d1 - d3)
+        return a + v * ab, (1.0 - v, v, 0.0)
+
+    cp = p - c
+    d5 = np.dot(ab, cp)
+    d6 = np.dot(ac, cp)
+    if d6 >= 0.0 and d5 <= d6:
+        return c, (0.0, 0.0, 1.0)
+
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+        w = d2 / (d2 - d6)
+        return a + w * ac, (1.0 - w, 0.0, w)
+
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        return b + w * (c - b), (0.0, 1.0 - w, w)
+
+    denom = 1.0 / (va + vb + vc)
+    v = vb * denom
+    w = vc * denom
+    return a + ab * v + ac * w, (1.0 - v - w, v, w)
 
 
 def _panel_coulomb_field(x, v0, v1, v2, s0, s1, s2, area, refine_ratio, max_depth):
@@ -167,7 +227,6 @@ def evaluate_coulomb_field(vertices, elements, sigma_nodal, points, refine_ratio
     flat_points = points.reshape(-1, 3)
 
     v = vertices.T  # (n_vertices, 3)
-    normals = vertex_normals(vertices, elements).T  # (n_vertices, 3)
 
     panels = []
     areas = []
@@ -175,38 +234,48 @@ def evaluate_coulomb_field(vertices, elements, sigma_nodal, points, refine_ratio
         v0, v1, v2 = v[i0], v[i1], v[i2]
         raw_normal = -np.cross(v1 - v0, v2 - v0)
         area = 0.5 * np.linalg.norm(raw_normal)
-        panels.append((v0, v1, v2, i0, i1, i2, area))
+        n = raw_normal / (2.0 * area)  # exact flat-panel normal, not a vertex average
+        panels.append((v0, v1, v2, i0, i1, i2, area, n))
         areas.append(area)
 
     # The sigma_ref shift-and-add-back trick (see module docstring) is only
     # correct extremely close to the surface -- the "add back" term
     # approximates the reference density's own contribution as a local
     # infinite sheet, which only holds within a small fraction of one
-    # element's size (checked empirically against the analytic hemisphere
-    # solution: comparable to plain summation by ~0.5% of an element size
-    # of standoff, and clearly worse beyond that, since a real point sees
-    # the shifted-away charge's field decay with distance rather than stay
-    # constant like an infinite sheet's would). Plain (unshifted) summation
-    # is already accurate outside this thin shell -- no near-panel
-    # difficulty there -- so the shift is only applied inside it.
-    near_surface_threshold = 0.05 * np.sqrt(np.mean(areas))
+    # element's size. Plain (unshifted) summation is already accurate
+    # outside this thin shell -- no near-panel difficulty there -- so the
+    # shift is only applied inside it.
+    near_surface_threshold = 0.5 * np.sqrt(np.mean(areas))
 
     result = np.empty((flat_points.shape[0], 3))
     for i, x in enumerate(flat_points):
-        nearest = np.argmin(np.sum((v - x) ** 2, axis=-1))
-        near_surface = np.linalg.norm(v[nearest] - x) < near_surface_threshold
-        sigma_ref = sigma_nodal[nearest] if near_surface else 0.0
+        best_dist2 = np.inf
+        closest = None
+        for v0, v1, v2, i0, i1, i2, area, n in panels:
+            point, bary = _closest_point_on_triangle(x, v0, v1, v2)
+            dist2 = np.sum((x - point) ** 2)
+            if dist2 < best_dist2:
+                best_dist2 = dist2
+                closest = (bary, i0, i1, i2, n)
 
-        E = sigma_ref * normals[nearest]  # exact contribution of the shifted-away reference density
-        for v0, v1, v2, i0, i1, i2, area in panels:
+        bary, i0, i1, i2, n_local = closest
+        near_surface = best_dist2 < near_surface_threshold**2
+        sigma_ref = (
+            bary[0] * sigma_nodal[i0] + bary[1] * sigma_nodal[i1] + bary[2] * sigma_nodal[i2]
+            if near_surface
+            else 0.0
+        )
+
+        E = sigma_ref * n_local  # exact contribution of the shifted-away reference density
+        for v0, v1, v2, j0, j1, j2, area, n in panels:
             E += _panel_coulomb_field(
                 x,
                 v0,
                 v1,
                 v2,
-                sigma_nodal[i0] - sigma_ref,
-                sigma_nodal[i1] - sigma_ref,
-                sigma_nodal[i2] - sigma_ref,
+                sigma_nodal[j0] - sigma_ref,
+                sigma_nodal[j1] - sigma_ref,
+                sigma_nodal[j2] - sigma_ref,
                 area,
                 refine_ratio,
                 max_depth,

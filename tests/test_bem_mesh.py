@@ -9,7 +9,6 @@ from specific_particle_tracer.bem.mesh import (
     min_distance_to_profile,
     revolve_profile,
     sphere_mesh,
-    vertex_normals,
 )
 
 
@@ -116,22 +115,3 @@ def test_sphere_mesh_is_closed_and_all_vertices_lie_on_the_sphere():
             edge = tuple(sorted((tri[i], tri[(i + 1) % 3])))
             edge_counts[edge] = edge_counts.get(edge, 0) + 1
     assert set(edge_counts.values()) == {2}
-
-
-def test_vertex_normals_point_outward_on_a_sphere():
-    """On a sphere the true outward normal at any point is just its own
-    radial direction -- a strong, geometry-independent check that
-    revolve_profile's triangle winding (and vertex_normals' use of it) is
-    self-consistent. vertex_normals is only an area-weighted *approximation*
-    to the true normal (exact only in the continuum limit), so check angular
-    deviation with a tolerance appropriate to this mesh's resolution rather
-    than expecting an exact match."""
-    R = 50e-9
-    vertices, elements = sphere_mesh(R, n_theta=20, n_phi=24)
-    normals = vertex_normals(vertices, elements)
-
-    assert np.allclose(np.linalg.norm(normals, axis=0), 1.0)
-
-    radial = vertices / np.linalg.norm(vertices, axis=0)
-    cos_angle = np.clip(np.sum(normals * radial, axis=0), -1.0, 1.0)
-    assert np.degrees(np.arccos(cos_angle)).max() < 5.0

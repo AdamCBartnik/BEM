@@ -49,18 +49,24 @@ Known limitation: `evaluate` gets its field from `bem.panel_field` (direct
 Coulomb-law integration of the solved surface charge over every mesh
 panel, with a near-surface regularization -- see `bem.laplace`/
 `bem.panel_field` for why this indirect/charge-simulation formulation was
-chosen over the mixed direct one, and for the regularization itself).
-Accuracy improves monotonically with distance from the tip: a few percent
-by r ~ 1.02R, sub-percent by r ~ 1.05R, and even *exactly* on the mesh
-surface (r = R itself, where the unregularized sum was off by ~100%) is
-now only off by ~10%. The mesh is flat-faceted, not curved, so r = R (the
+chosen over the mixed direct one, and for the regularization itself, which
+went through two versions this project has kept for the record). Accuracy
+improves monotonically with distance from the tip: sub-percent by
+r ~ 1.05R, and *exactly* on the mesh surface (r = R itself, where the
+unregularized sum was off by 100%+) is now only off by ~10-20% at a
+moderate mesh resolution (n_theta=30) -- and, unlike the first version of
+this regularization, genuinely shrinks under mesh refinement (~24% at
+n_theta=20 down to ~4% at n_theta=90), rather than plateauing regardless
+of resolution. The mesh is flat-faceted, not curved, so r = R (the
 analytic sphere's own surface) sits just barely *outside* the discretized
-geometry except at mesh vertices -- this residual ~10% is what's left of
-that same near-panel difficulty after regularization. Since particles are
-emitted essentially at r = R, this is the accuracy that matters most for
-real usage, and pushing it further (a dedicated near-singular quadrature
-transform, e.g. Telles' or the Johnston-Elliott sinh transform, is the
-natural next thing to try if needed) is still open.
+geometry except at mesh vertices -- this residual error, at any given
+resolution, is what's left of that same near-panel difficulty after
+regularization. Since particles are emitted essentially at r = R, this is
+the accuracy that matters most for real usage: for now, use a finer mesh
+if better on-surface accuracy is needed; a dedicated near-singular
+quadrature transform (e.g. Telles' or the Johnston-Elliott sinh
+transform) is the natural next thing to try if resolution alone isn't
+enough.
 """
 
 import numpy as np
