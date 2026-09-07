@@ -230,6 +230,23 @@ def integrate(
             vel[acc_idx] = vel_new[accepted]
             t[acc_idx] = t_new[accepted]
 
+            # A group whose step just landed on one of its own birth
+            # checkpoints is about to integrate real dynamics for the
+            # first time with a step size `h` that has nothing to do with
+            # that -- it's whatever the *frozen* phase grew it to via free
+            # 10x-per-step growth (zero derivative there, so every such
+            # step is trivially accepted). Carrying that stale, often wildly
+            # oversized h into the newly-active dynamics causes a huge
+            # first-attempt error, several rejected retries, and can even
+            # land the eventually-accepted step spuriously inside a kill
+            # boundary that the particle's actual (outward) velocity would
+            # never have carried it into. Reset to a conservative step so
+            # the new dynamics ramps up normally instead.
+            tol = 1e-9 * xp.maximum(t_max, 1e-30)
+            reached_birth_checkpoint = (~exhausted[accepted]) & (t[acc_idx] >= next_checkpoint[accepted] - tol)
+            if xp.any(reached_birth_checkpoint):
+                h[acc_idx] = xp.where(reached_birth_checkpoint, t_max * initial_step_fraction, h[acc_idx])
+
             if kill_fn is not None:
                 newly_killed = was_active & kill_fn(pos[acc_idx])
                 if xp.any(newly_killed):

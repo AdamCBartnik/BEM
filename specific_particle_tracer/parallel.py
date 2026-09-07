@@ -28,8 +28,8 @@ from .trajectories import TrajectoryRecorder, record_output
 
 def run_parallel(
     n_workers,
-    init_pos, init_vel, t_birth, charge, weight, ids,
-    mass, geometry_worker_args, plummer_radius, screens, output_times,
+    init_pos, init_vel, t_birth, charge, particle_mass, weight, ids,
+    charge_to_mass, geometry_worker_args, plummer_radius, screens, output_times,
     rtol, atol, t_max,
 ):
     """Run the tracker's integration split across `n_workers` processes,
@@ -51,8 +51,8 @@ def run_parallel(
 
     jobs = [
         (
-            init_pos[idx], init_vel[idx], t_birth[idx], charge[idx], weight[idx], ids[idx],
-            mass, geometry_worker_args, plummer_radius, screens, output_times, rtol, atol, t_max,
+            init_pos[idx], init_vel[idx], t_birth[idx], charge[idx], particle_mass[idx], weight[idx], ids[idx],
+            charge_to_mass, geometry_worker_args, plummer_radius, screens, output_times, rtol, atol, t_max,
         )
         for idx in chunk_group_indices
     ]
@@ -80,12 +80,12 @@ def _merge_records(pieces):
 
 def _run_chunk(args):
     (
-        init_pos, init_vel, t_birth, charge, weight, ids,
-        mass, geometry_worker_args, plummer_radius, screens, output_times, rtol, atol, t_max,
+        init_pos, init_vel, t_birth, charge, particle_mass, weight, ids,
+        charge_to_mass, geometry_worker_args, plummer_radius, screens, output_times, rtol, atol, t_max,
     ) = args
 
     geometry = geometry_module.Geometry.from_worker_args(geometry_worker_args, xp=np)
-    accel = geometry_module.make_accel_fn(charge, mass, geometry, plummer_radius, xp=np)
+    accel = geometry_module.make_accel_fn(charge, particle_mass, charge_to_mass, geometry, plummer_radius, xp=np)
 
     recorders = [ScreenRecorder(z, xp=np) for z in screens]
 

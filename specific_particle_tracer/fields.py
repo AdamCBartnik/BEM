@@ -117,7 +117,16 @@ class HemisphericalTipField:
         r2 = x * x + y * y + z * z
         r = xp.sqrt(r2)
 
-        valid = (r >= R) & (z >= 0.0)
+        # A tolerance below R, not an exact r >= R, because particles are
+        # typically placed on this surface via distributions.py's
+        # sqrt(R^2 - x^2 - y^2)-based mapping -- recomputing r here from
+        # (x, y, z) doesn't exactly invert that sqrt in floating point, so
+        # a particle meant to sit exactly at r=R can land a bit below it.
+        # Without this tolerance, such a particle sees zero field (rather
+        # than the ~3x-enhanced field it should), leaving nothing to
+        # oppose its own image-charge attraction back into the tip -- a
+        # real bug this project hit, not a hypothetical one.
+        valid = (r >= R * (1.0 - 1e-6)) & (z >= 0.0)
         r_safe = xp.where(valid, r, R)  # avoid 0/0 where invalid; discarded below
         r3 = r_safe * r_safe * r_safe
         r5 = r3 * r_safe * r_safe

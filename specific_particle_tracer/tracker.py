@@ -158,10 +158,20 @@ class SpecificParticleTracer:
         self.n_groups, self.n_per_group = idx.shape
 
         mass_ev = pg.mass
-        self.mass = ev_to_kg(mass_ev)
+        self.mass = ev_to_kg(mass_ev)  # single-particle rest mass [kg]
+
+        # Scalar species charge-to-mass ratio (e.g. -e/m_e for an
+        # electron), for the *external field* term: a macroparticle's
+        # acceleration under a field is intrinsic to its species, not its
+        # statistical weight. Charge-charge terms (Coulomb, image) instead
+        # need each macroparticle's own (weight-scaled) charge and mass --
+        # see geometry.make_accel_fn's docstring for why conflating these
+        # is a real bug, not a hypothetical one.
+        self.charge_to_mass = float(pg.species_charge) / self.mass
 
         charge_sign = np.sign(pg.species_charge)
         charge = charge_sign * np.asarray(pg.weight)  # signed, per particle [C]
+        particle_mass = self.mass * (np.asarray(pg.weight) / abs(pg.species_charge))
 
         x = np.asarray(pg.x)
         y = np.asarray(pg.y)
@@ -183,6 +193,7 @@ class SpecificParticleTracer:
         self.init_vel = xp.asarray(np.stack([vx[idx], vy[idx], vz[idx]], axis=-1), dtype=dtype)
         self.t_birth = xp.asarray(t_birth[idx], dtype=dtype)
         self.charge = xp.asarray(charge[idx], dtype=dtype)
+        self.particle_mass = xp.asarray(particle_mass[idx], dtype=dtype)
         self.weight = xp.asarray(weight[idx], dtype=dtype)
         self.ids = xp.asarray(ids[idx])
         self.species = pg.species
@@ -205,8 +216,10 @@ class SpecificParticleTracer:
         return default_t_max
 
     def _field_accel_scale(self):
-        q = float(self.xp.abs(self.charge).max()) if self.charge.size else 0.0
-        return abs(self.geometry.E_gun) * q / self.mass
+        # The species charge-to-mass ratio, not weight-scaled: a
+        # macroparticle's acceleration under the external field is
+        # intrinsic to its species (see geometry.make_accel_fn).
+        return abs(self.geometry.E_gun) * abs(self.charge_to_mass)
 
     # ------------------------------------------------------------------
     # Simulation
@@ -228,8 +241,8 @@ class SpecificParticleTracer:
         if self.n_workers > 1:
             merged_screens, merged_trajectories = parallel_module.run_parallel(
                 self.n_workers,
-                self.init_pos, self.init_vel, self.t_birth, self.charge, self.weight, self.ids,
-                self.mass, self.geometry.worker_args(), self.plummer_radius,
+                self.init_pos, self.init_vel, self.t_birth, self.charge, self.particle_mass, self.weight, self.ids,
+                self.charge_to_mass, self.geometry.worker_args(), self.plummer_radius,
                 self.screen_positions, self.output_times_host, self.rtol, self.atol, self.t_max,
             )
             if verbose:
@@ -240,7 +253,9 @@ class SpecificParticleTracer:
             )
 
         xp = self.xp
-        accel_fn = geometry_module.make_accel_fn(self.charge, self.mass, self.geometry, self.plummer_radius, xp=xp)
+        accel_fn = geometry_module.make_accel_fn(
+            self.charge, self.particle_mass, self.charge_to_mass, self.geometry, self.plummer_radius, xp=xp,
+        )
 
         recorders = [ScreenRecorder(z, xp=xp) for z in self.screen_positions]
         n_step_batches = 0

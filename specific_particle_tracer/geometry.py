@@ -161,7 +161,12 @@ class HemisphericalTip(Geometry):
 
     def kill_mask(self, position):
         xp = self.xp
-        inside_tip = xp.sum(position * position, axis=-1) <= self.R * self.R
+        # Same tolerance as HemisphericalTipField.field's r >= R*(1-tol):
+        # keeps the field-on and kill regions from overlapping right at
+        # the numerical boundary (a particle placed via distributions.py's
+        # sqrt-based mapping can land a hair below r=R in floating point).
+        r_kill = self.R * (1.0 - 1e-6)
+        inside_tip = xp.sum(position * position, axis=-1) <= r_kill * r_kill
         if self.kill_z_below is None:
             return inside_tip
         return inside_tip | (position[..., 2] <= self.kill_z_below)
@@ -181,16 +186,36 @@ _WORKER_REGISTRY = {
 }
 
 
-def make_accel_fn(charge, mass, geometry, plummer_radius, xp=np):
+def make_accel_fn(charge, particle_mass, charge_to_mass, geometry, plummer_radius, xp=np):
     """Build accel(pos, vel, active, group_idx) -> accel, closing over the
-    (already backend-resident) per-group `charge` array it should index
-    with `group_idx`, and the given Geometry for field + image force."""
+    (already backend-resident) per-group `charge`/`particle_mass` arrays it
+    should index with `group_idx`, and the given Geometry for field +
+    image force.
+
+    `charge_to_mass` (a scalar, species_charge / single-particle mass, e.g.
+    -e/m_e for an electron) drives the *external field* term -- a
+    macroparticle's acceleration under an external field doesn't depend on
+    how many real particles its statistical weight represents, only on the
+    species' intrinsic charge-to-mass ratio. `particle_mass` (per-particle,
+    scaled the same way `charge`'s weight is: mass_species * weight /
+    |species_charge|) is used for the *charge-charge* terms (Coulomb,
+    image), where the force genuinely does scale with each macroparticle's
+    own charge and so needs dividing by its own (equally scaled) mass to
+    get back the right acceleration. Getting this distinction wrong --
+    e.g. dividing the field force by the bare single-particle mass while
+    using the full macro-charge -- inflates the field acceleration by the
+    macroparticle's weighting factor, which is invisible whenever every
+    particle happens to carry exactly one elementary charge of weight (as
+    in the flat-weight test fixtures used throughout this project) and
+    very wrong otherwise.
+    """
 
     def accel(pos, vel, active, group_idx):
         c = charge[group_idx]
-        accel_field = c[..., None] / mass * geometry.field(pos)
-        accel_coulomb = coulomb_force(pos, c, active, plummer_radius, xp=xp) / mass
-        accel_image = geometry.image_force(pos, c, active, plummer_radius) / mass
+        m = particle_mass[group_idx]
+        accel_field = charge_to_mass * geometry.field(pos)
+        accel_coulomb = coulomb_force(pos, c, active, plummer_radius, xp=xp) / m[..., None]
+        accel_image = geometry.image_force(pos, c, active, plummer_radius) / m[..., None]
         acc = accel_field + accel_coulomb + accel_image
         return xp.where(active[..., None], acc, 0.0)
 
