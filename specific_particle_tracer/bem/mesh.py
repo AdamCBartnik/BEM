@@ -146,6 +146,41 @@ def hemisphere_tip_image_mesh(R, z0, plane_radius, n_theta=40, n_fillet=20, n_r=
     return revolve_profile(profile, n_phi)
 
 
+def vertex_normals(vertices, elements):
+    """Area-weighted outward unit normal at each mesh vertex: the average
+    of the (outward) normals of every triangle touching that vertex,
+    weighted by triangle area.
+
+    Used by `panel_field`'s near-panel field regularization, which needs a
+    local outward-normal direction near an evaluation point without
+    assuming anything about the underlying analytic geometry (unlike, e.g.,
+    just using x/|x| for a sphere).
+
+    Parameters
+    ----------
+    vertices, elements : the mesh, BEMpp convention (see module docstring).
+
+    Returns
+    -------
+    normals : ndarray, shape (3, n_vertices), unit vectors.
+    """
+    vertices = np.asarray(vertices, dtype=float)
+    elements = np.asarray(elements, dtype=int)
+    v = vertices.T
+
+    normals = np.zeros_like(v)
+    for i0, i1, i2 in elements.T:
+        v0, v1, v2 = v[i0], v[i1], v[i2]
+        # -cross(...): revolve_profile winds triangles so this is the
+        # outward normal (checked against the sphere case).
+        raw_normal = -np.cross(v1 - v0, v2 - v0)  # magnitude = 2*area
+        for i in (i0, i1, i2):
+            normals[i] += raw_normal
+
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+    return normals.T
+
+
 def min_distance_to_profile(points_rz, profile_rz):
     """For each (r, z) in points_rz, the minimum Euclidean distance to the
     polyline through profile_rz. Used to numerically check that an offset

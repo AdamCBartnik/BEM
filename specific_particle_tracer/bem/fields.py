@@ -47,26 +47,20 @@ BEM problem:
 
 Known limitation: `evaluate` gets its field from `bem.panel_field` (direct
 Coulomb-law integration of the solved surface charge over every mesh
-panel -- see `bem.laplace`/`bem.panel_field` for why this indirect/charge-
-simulation formulation was chosen over the mixed direct one). That's
-accurate close to the tip -- sub-percent error by r ~ 1.05R, a few percent
-by r ~ 1.01R -- but still not accurate *exactly* on the mesh surface
-(r = R exactly), where error is still of order 100%. The mesh is flat-
-faceted, not curved, so r = R (the analytic sphere's own surface) sits
-just barely *outside* the discretized geometry except at mesh vertices --
-a standoff that shrinks, rather than grows, under mesh refinement, so this
-isn't fixed by a finer mesh either. If exact on-surface accuracy is
-needed, the next things to try, in rough order of effort: (a) a dedicated
-near-singular quadrature transform (Telles' or the Johnston-Elliott sinh
-transform) in `bem.panel_field`, since the current adaptive-subdivision
-scheme plateaus rather than converging as the standoff shrinks; or (b) the
-closed-form jump relation for a single-layer potential's normal
-derivative, which decomposes the on-surface field into sigma/2 (known)
-plus the *weakly* singular (not hypersingular) adjoint-double-layer
-operator applied to sigma -- both already directly available from bempp,
-and this sidesteps near-panel quadrature for the on-surface case entirely.
-Neither is implemented yet. Since particles are emitted essentially at
-r = R, this matters for any real usage.
+panel, with a near-surface regularization -- see `bem.laplace`/
+`bem.panel_field` for why this indirect/charge-simulation formulation was
+chosen over the mixed direct one, and for the regularization itself).
+Accuracy improves monotonically with distance from the tip: a few percent
+by r ~ 1.02R, sub-percent by r ~ 1.05R, and even *exactly* on the mesh
+surface (r = R itself, where the unregularized sum was off by ~100%) is
+now only off by ~10%. The mesh is flat-faceted, not curved, so r = R (the
+analytic sphere's own surface) sits just barely *outside* the discretized
+geometry except at mesh vertices -- this residual ~10% is what's left of
+that same near-panel difficulty after regularization. Since particles are
+emitted essentially at r = R, this is the accuracy that matters most for
+real usage, and pushing it further (a dedicated near-singular quadrature
+transform, e.g. Telles' or the Johnston-Elliott sinh transform, is the
+natural next thing to try if needed) is still open.
 """
 
 import numpy as np
