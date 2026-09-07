@@ -1,6 +1,7 @@
 """SpecificParticleTracer: the main simulation driver."""
 
 import os
+import warnings
 
 import numpy as np
 
@@ -107,6 +108,15 @@ class SpecificParticleTracer:
     t_max : float, optional
         Total simulated time [s]. If not given, a default is chosen from
         the single-particle transit time to the farthest screen.
+    z_max : float, optional
+        A particle that flies past z_max is killed (frozen, excluded from
+        further dynamics) exactly like one that falls back into the
+        conductor. Nothing in this tracker's field model ever turns off,
+        so an escaped particle would otherwise coast all the way to t_max
+        for no purpose; killing it once it's past the last z of interest
+        (e.g. well beyond your farthest screen) can save real time on
+        problems that would otherwise spend many steps on already-done
+        particles. None (default) disables this cutoff.
     """
 
     def __init__(
@@ -122,6 +132,7 @@ class SpecificParticleTracer:
         rtol=None,
         atol=None,
         t_max=None,
+        z_max=None,
     ):
         if n_workers != 1 and backend != "cpu":
             raise ValueError(
@@ -133,6 +144,7 @@ class SpecificParticleTracer:
         self.screen_positions = list(screens)
         self.output_times_host = None if t_out is None else np.sort(np.asarray(t_out, dtype=float))
         self.plummer_radius = plummer_radius
+        self.z_max = z_max
         self.n_workers = os.cpu_count() if n_workers is None else n_workers
 
         self.backend_name = backend
@@ -169,9 +181,36 @@ class SpecificParticleTracer:
         # is a real bug, not a hypothetical one.
         self.charge_to_mass = float(pg.species_charge) / self.mass
 
+        # This tracker models individual real particles, not statistical
+        # macroparticles -- Coulomb and image-charge forces here scale
+        # with each particle's own weight (see geometry.make_accel_fn),
+        # which is only physically meaningful if that weight really is one
+        # elementary charge (e.g. a macroparticle's own self-image force
+        # would otherwise scale with weight^2, not the weight it should
+        # scale with for N real particles' aggregate self-attraction).
+        # Rather than silently doing the wrong physics for a distribution
+        # built with some other total-charge convention (as real-world
+        # generators like distgen default to), every particle's weight is
+        # forced to the species' elementary charge, with a warning if that
+        # changed anything.
+        species_charge_magnitude = abs(pg.species_charge)
+        weight = np.asarray(pg.weight)
+        # atol=0: these are ~1e-19 C values, and np.allclose's default
+        # atol=1e-8 would call any two of them "close" regardless of rtol.
+        if not np.allclose(weight, species_charge_magnitude, rtol=1e-9, atol=0):
+            warnings.warn(
+                "SpecificParticleTracer models individual real particles, not "
+                "statistical macroparticles: overriding initial_particles.weight "
+                f"(which was not uniformly {species_charge_magnitude:.6e} C, the "
+                f"species' elementary charge) so every particle carries exactly "
+                "one elementary charge of weight.",
+                stacklevel=2,
+            )
+            weight = np.full_like(weight, species_charge_magnitude)
+
         charge_sign = np.sign(pg.species_charge)
-        charge = charge_sign * np.asarray(pg.weight)  # signed, per particle [C]
-        particle_mass = self.mass * (np.asarray(pg.weight) / abs(pg.species_charge))
+        charge = charge_sign * weight  # signed, per particle [C]
+        particle_mass = self.mass * (weight / species_charge_magnitude)
 
         x = np.asarray(pg.x)
         y = np.asarray(pg.y)
@@ -181,7 +220,6 @@ class SpecificParticleTracer:
         vz = ev_c_to_si_momentum(np.asarray(pg.pz)) / self.mass
         t_birth = np.asarray(pg.t)
         ids = np.asarray(pg.id)
-        weight = np.asarray(pg.weight)
 
         # Everything stays in this (n_groups, n_per_group, ...) grouped
         # form throughout -- the Coulomb/image sums need it, and it's also
@@ -243,7 +281,7 @@ class SpecificParticleTracer:
                 self.n_workers,
                 self.init_pos, self.init_vel, self.t_birth, self.charge, self.particle_mass, self.weight, self.ids,
                 self.charge_to_mass, self.geometry.worker_args(), self.plummer_radius,
-                self.screen_positions, self.output_times_host, self.rtol, self.atol, self.t_max,
+                self.screen_positions, self.output_times_host, self.rtol, self.atol, self.t_max, self.z_max,
             )
             if verbose:
                 print(f"{self.n_groups} groups split across {self.n_workers} worker processes (backend=cpu)")
@@ -279,9 +317,10 @@ class SpecificParticleTracer:
                     self.t_birth, self.charge, self.ids, self.weight, xp=xp,
                 )
 
+        kill_fn = geometry_module.make_kill_fn(self.geometry, self.z_max)
         batched_rk45.integrate(
             accel_fn, self.init_pos, self.init_vel, self.t_birth, self.t_max,
-            self.rtol, self.atol, on_step=on_step, kill_fn=self.geometry.kill_mask,
+            self.rtol, self.atol, on_step=on_step, kill_fn=kill_fn,
             output_times=self.output_times, on_output=on_output, xp=xp,
         )
 

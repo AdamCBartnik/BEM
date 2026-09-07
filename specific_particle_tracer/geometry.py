@@ -220,3 +220,24 @@ def make_accel_fn(charge, particle_mass, charge_to_mass, geometry, plummer_radiu
         return xp.where(active[..., None], acc, 0.0)
 
     return accel
+
+
+def make_kill_fn(geometry, z_max=None):
+    """A Geometry's own kill_mask, optionally combined with a z_max cutoff:
+    kill a particle once it flies past z_max too, e.g. well beyond the
+    farthest screen/output time of interest. Since nothing in this
+    tracker's model ever turns the external field off, an escaping
+    particle would otherwise just keep coasting (taking ever-larger, but
+    still non-free, adaptive steps) all the way to t_max for no purpose --
+    z_max lets such particles stop being simulated once they're clearly
+    done mattering, which is the same "already known to be irrelevant"
+    savings kill_mask itself gives for particles that fall back into the
+    conductor. None (default) disables this cutoff.
+    """
+    if z_max is None:
+        return geometry.kill_mask
+
+    def kill_fn(pos):
+        return geometry.kill_mask(pos) | (pos[..., 2] >= z_max)
+
+    return kill_fn

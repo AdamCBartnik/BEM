@@ -30,7 +30,7 @@ def run_parallel(
     n_workers,
     init_pos, init_vel, t_birth, charge, particle_mass, weight, ids,
     charge_to_mass, geometry_worker_args, plummer_radius, screens, output_times,
-    rtol, atol, t_max,
+    rtol, atol, t_max, z_max,
 ):
     """Run the tracker's integration split across `n_workers` processes,
     partitioning groups (the leading axis of the grouped arrays) evenly
@@ -52,7 +52,7 @@ def run_parallel(
     jobs = [
         (
             init_pos[idx], init_vel[idx], t_birth[idx], charge[idx], particle_mass[idx], weight[idx], ids[idx],
-            charge_to_mass, geometry_worker_args, plummer_radius, screens, output_times, rtol, atol, t_max,
+            charge_to_mass, geometry_worker_args, plummer_radius, screens, output_times, rtol, atol, t_max, z_max,
         )
         for idx in chunk_group_indices
     ]
@@ -81,7 +81,7 @@ def _merge_records(pieces):
 def _run_chunk(args):
     (
         init_pos, init_vel, t_birth, charge, particle_mass, weight, ids,
-        charge_to_mass, geometry_worker_args, plummer_radius, screens, output_times, rtol, atol, t_max,
+        charge_to_mass, geometry_worker_args, plummer_radius, screens, output_times, rtol, atol, t_max, z_max,
     ) = args
 
     geometry = geometry_module.Geometry.from_worker_args(geometry_worker_args, xp=np)
@@ -106,9 +106,10 @@ def _run_chunk(args):
                 t_birth, charge, ids, weight, xp=np,
             )
 
+    kill_fn = geometry_module.make_kill_fn(geometry, z_max)
     batched_rk45.integrate(
         accel, init_pos, init_vel, t_birth, t_max, rtol, atol,
-        on_step=on_step, kill_fn=geometry.kill_mask,
+        on_step=on_step, kill_fn=kill_fn,
         output_times=None if output_times is None else np.asarray(output_times), on_output=on_output, xp=np,
     )
 
