@@ -1,0 +1,20 @@
+[project]
+name = "specific-particle-tracer"
+version = "0.1.0"
+description = "A lightweight tracker for electrons emitted from cathode nanostructures, over the first few microns of flight."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "openpmd-beamphysics",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["specific_particle_tracer*"]
