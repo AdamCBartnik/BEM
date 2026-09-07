@@ -1,0 +1,44 @@
+n_particle: 2000
+random:
+    type: pseudo
+species: electron
+
+fix_avg_and_stds: False
+
+total_charge:
+  units: fC
+  value: 1
+
+r_dist:
+  type: rsg
+  sigma_xy:
+    units: mm
+    value: 1.0
+  alpha:
+    units: dimensionless
+    value: 1.0
+  
+t_dist:
+  type: sg
+  sigma_t: 
+    units: ps
+    value: 1
+  n_sigma_cutoff:
+    units: dimensionless
+    value: 4.0
+  alpha:
+    units: dimensionless
+    value: 0.5
+   
+output:
+  file: gpt.particles.gdf
+  type: gpt
+
+start:
+  MTE:
+    units: meV
+    value: 50
+  type: cathode
+
+# NO TRANSFORMS !!
+# Jeez, you don't have to yell
