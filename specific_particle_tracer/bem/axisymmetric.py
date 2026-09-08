@@ -13,9 +13,20 @@ now exact rather than a discretized sum over n_phi panels) a much smoother
 field as a function of position, which matters for an adaptive ODE
 integrator stepping through it.
 
-This only works because the excitation is axisymmetric; a shape or applied
-field without that symmetry still needs the general bem.mesh/bem.laplace
-machinery.
+This only works because the excitation is axisymmetric, not merely because
+the geometry is: a uniform field along the symmetry axis has Dirichlet
+data with no phi-dependence, so the induced charge has none either. That
+holds for any future axisymmetric real-cathode shape sitting in an
+on-axis field, not just this hemisphere-tip case. It will *not* hold for
+the image-charge job, even on the (still axisymmetric) recessed surface:
+the excitation there is a real particle at some generally off-axis 3D
+position, which breaks the rotational symmetry of the induced image
+charge regardless of the surface's own symmetry -- so that job should
+default to the general 3D machinery (bem.mesh/bem.panel_field), not try
+to force a 1D reduction here. (A middle ground exists if 3D turns out too
+slow there too: decompose the off-axis excitation into azimuthal Fourier
+modes and solve one 1D problem per mode -- more moving parts, so a
+fallback optimization, not a starting point.)
 
 Physics
 -------
