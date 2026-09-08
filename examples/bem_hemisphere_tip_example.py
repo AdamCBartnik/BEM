@@ -142,7 +142,9 @@ for theta_deg, d_over_R in [(5.0, 0.1), (20.0, 0.1)]:
     charge = np.array([-ELEMENTARY_CHARGE])
     active = np.array([True])
 
-    F_bem = bem_geom_with_image.image_force(position.reshape(1, 3), charge, active, plummer_radius=1e-12)[0]
+    # (n_groups=1, n_emit=1, 3): image_force requires the group axis
+    # explicit, since only particles within the same group interact.
+    F_bem = bem_geom_with_image.image_force(position.reshape(1, 1, 3), charge.reshape(1, 1), active.reshape(1, 1), plummer_radius=1e-12)[0, 0]
     F_exact = hemispherical_tip_image_force(
         position.reshape(1, 1, 3), charge.reshape(1, 1), active.reshape(1, 1), R - DEFAULT_Z0, plummer_radius=1e-12
     )[0, 0]
@@ -157,13 +159,16 @@ print("-- not just each particle's own self-image. hemispherical_tip_image_force
 print("includes that cross-term too (its own all-pairs treatment), so this is")
 print("still an apples-to-apples comparison, just with N=2 this time.")
 theta_pair = np.radians([5.0, 20.0])
-positions_pair = 1.1 * R * np.column_stack([np.sin(theta_pair), np.zeros(2), np.cos(theta_pair)])
-charges_pair = np.full(2, -ELEMENTARY_CHARGE)
-active_pair = np.ones(2, dtype=bool)
+# One group of two (n_groups=1, n_emit=2): both particles must be in the
+# SAME group for the cross-term to apply at all -- image_force treats
+# different groups as never interacting, like every other force here.
+positions_pair = (1.1 * R * np.column_stack([np.sin(theta_pair), np.zeros(2), np.cos(theta_pair)]))[None, :, :]
+charges_pair = np.full((1, 2), -ELEMENTARY_CHARGE)
+active_pair = np.ones((1, 2), dtype=bool)
 
-F_bem_pair = bem_geom_with_image.image_force(positions_pair, charges_pair, active_pair, plummer_radius=1e-12)
+F_bem_pair = bem_geom_with_image.image_force(positions_pair, charges_pair, active_pair, plummer_radius=1e-12)[0]
 F_exact_pair = hemispherical_tip_image_force(
-    positions_pair[None, :, :], charges_pair[None, :], active_pair[None, :], R - DEFAULT_Z0, plummer_radius=1e-12
+    positions_pair, charges_pair, active_pair, R - DEFAULT_Z0, plummer_radius=1e-12
 )[0]
 for i in range(2):
     rel_err = np.linalg.norm(F_bem_pair[i] - F_exact_pair[i]) / np.linalg.norm(F_exact_pair[i])

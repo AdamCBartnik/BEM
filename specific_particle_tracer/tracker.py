@@ -94,13 +94,24 @@ class SpecificParticleTracer:
         than better). Not supported with backend='gpu' (each worker would
         need its own device context and they'd contend for the same GPU
         rather than help each other). Only worth it once per-worker
-        compute outweighs process-startup cost -- in testing, n_workers>1
-        was a net loss for a couple thousand groups and a clear win
-        (several x) from tens of thousands of groups up. On Windows (and
-        anywhere multiprocessing uses 'spawn'), calling code with
-        n_workers>1 must sit behind ``if __name__ == "__main__":`` in the
-        top-level script, or the worker processes will try to re-run that
-        script themselves.
+        compute outweighs process-startup cost -- for the field-only case
+        (HemisphericalTip's closed-form field + analytic image force),
+        measured directly on an 8-physical-core/16-thread machine:
+        n_workers>1 was a net loss at 2000 groups (best case 1.41x at
+        4-8 workers; 16 workers *slower* than 1), a moderate win by 10000
+        groups (4.77x at 8 workers), and close to linear by 40000 groups
+        (5.71x at 8, 7.01x at 16). A CPU-heavier per-group force -- e.g.
+        bem.image_charge.ImageChargeBEMSolution.image_force, whose own
+        per-group cost is real linear algebra rather than a closed-form
+        evaluation -- earns a win at far smaller group counts instead
+        (measured: 2.96x/5.39x/7.79x at 2/4/8 workers with just 50 groups
+        sharing steps -- see that module's own docstring for why, and for
+        the bug this same benchmarking caught: an earlier version let
+        different groups' image-charge solves leak into each other). On
+        Windows (and anywhere multiprocessing uses 'spawn'), calling code
+        with n_workers>1 must sit behind ``if __name__ == "__main__":`` in
+        the top-level script, or the worker processes will try to re-run
+        that script themselves.
     rtol, atol : float, optional
         Relative and absolute convergence tolerance for the RK45
         integration, RMS-combined over each group's own (position [m],

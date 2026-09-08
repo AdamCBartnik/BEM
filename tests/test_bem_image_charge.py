@@ -239,20 +239,23 @@ def test_image_force_cross_coupling_matches_exact_flat_plane_multi_image():
     n_max = 4
     sol = ImageChargeBEMSolution.solve(profile, n_max=n_max)
 
-    positions = np.array([[0.5, 0.2, 0.4], [-0.3, 0.6, 0.7]])
-    charges = np.array([-1.0, -1.5])
-    active = np.array([True, True])
+    # Both particles in the SAME group (n_groups=1, n_emit=2): only
+    # particles within a group interact, matching image_charge_force's own
+    # (n_groups, n_emit, 3) convention below.
+    positions = np.array([[[0.5, 0.2, 0.4], [-0.3, 0.6, 0.7]]])
+    charges = np.array([[-1.0, -1.5]])
+    active = np.array([[True, True]])
 
-    F_bem = sol.image_force(positions, charges, active, d_lo=1e6, d_hi=1e6 + 1.0, n_max=n_max)
-    F_exact = image_charge_force(positions[None, :, :], charges[None, :], active[None, :], z0=0.0, plummer_radius=1e-12)[0]
+    F_bem = sol.image_force(positions, charges, active, d_lo=1e6, d_hi=1e6 + 1.0, n_max=n_max)[0]
+    F_exact = image_charge_force(positions, charges, active, z0=0.0, plummer_radius=1e-12)[0]
 
     assert np.max(np.abs(F_bem - F_exact) / np.abs(F_exact)) < 1e-10
 
     # And the cross term must actually matter: computing particle 0 as if
-    # it were alone must NOT match the joint (or exact) answer -- a single
-    # charge above an infinite flat plane feels a purely normal force, but
-    # particle 1's presence breaks that symmetry.
-    F0_alone = sol.image_force(positions[:1], charges[:1], active[:1], d_lo=1e6, d_hi=1e6 + 1.0, n_max=n_max)[0]
+    # it were alone (its own group of one) must NOT match the joint (or
+    # exact) answer -- a single charge above an infinite flat plane feels
+    # a purely normal force, but particle 1's presence breaks that symmetry.
+    F0_alone = sol.image_force(positions[:, :1], charges[:, :1], active[:, :1], d_lo=1e6, d_hi=1e6 + 1.0, n_max=n_max)[0, 0]
     assert F0_alone[0] == 0.0 and F0_alone[1] == 0.0
     assert abs(F_bem[0, 0]) > 0.1 * abs(F_bem[0, 2])
 
@@ -278,19 +281,18 @@ def test_image_force_cross_coupling_matches_exact_hemisphere_tip_multi_image():
     theta1, theta2 = np.radians(10.0), np.radians(25.0)
     p1 = 1.1 * R * np.array([np.sin(theta1), 0.0, np.cos(theta1)])
     p2 = 1.15 * R * np.array([0.0, np.sin(theta2), np.cos(theta2)])
-    positions = np.stack([p1, p2])
-    charges = np.array([-1.0, -1.0])
-    active = np.array([True, True])
+    # One group of two (only particles within a group interact).
+    positions = np.stack([p1, p2])[None, :, :]
+    charges = np.array([[-1.0, -1.0]])
+    active = np.array([[True, True]])
 
-    F_bem = sol.image_force(positions, charges, active, d_lo, d_hi, n_max=n_max)
-    F_exact = hemispherical_tip_image_force(
-        positions[None, :, :], charges[None, :], active[None, :], R - z0, plummer_radius=1e-12
-    )[0]
+    F_bem = sol.image_force(positions, charges, active, d_lo, d_hi, n_max=n_max)[0]
+    F_exact = hemispherical_tip_image_force(positions, charges, active, R - z0, plummer_radius=1e-12)[0]
 
     rel_err = np.linalg.norm(F_bem - F_exact, axis=-1) / np.linalg.norm(F_exact, axis=-1)
     assert np.max(rel_err) < 0.02
 
-    F0_alone = sol.image_force(positions[:1], charges[:1], active[:1], d_lo, d_hi, n_max=n_max)[0]
+    F0_alone = sol.image_force(positions[:, :1], charges[:, :1], active[:, :1], d_lo, d_hi, n_max=n_max)[0, 0]
     assert np.linalg.norm(F_bem[0] - F0_alone) > 0.1 * np.linalg.norm(F_exact[0])
 
 
@@ -315,9 +317,9 @@ def test_image_force_gpu_matches_cpu():
     theta1, theta2 = np.radians(15.0), np.radians(35.0)
     p1 = 1.1 * R * np.array([np.sin(theta1), 0.0, np.cos(theta1)])
     p2 = 1.2 * R * np.array([0.0, np.sin(theta2), np.cos(theta2)])
-    positions = np.stack([p1, p2])
-    charges = np.array([-1.0, -1.3])
-    active = np.array([True, True])
+    positions = np.stack([p1, p2])[None, :, :]
+    charges = np.array([[-1.0, -1.3]])
+    active = np.array([[True, True]])
     d_lo, d_hi = 0.1 * R, 0.5 * R
 
     F_cpu = sol.image_force(positions, charges, active, d_lo, d_hi, n_max=n_max, xp=np)
@@ -326,3 +328,56 @@ def test_image_force_gpu_matches_cpu():
     )
 
     assert np.max(np.abs(cp.asnumpy(F_gpu) - F_cpu) / np.abs(F_cpu)) < 1e-8
+
+
+def test_image_force_requires_explicit_group_axis():
+    """position must be (n_groups, n_emit, 3), not some other leading batch
+    shape -- an earlier version of this method accepted (and silently
+    mishandled) any leading shape by flattening it away before solving,
+    which broke group isolation (see the next test). A flat (N, 3) array
+    should now be rejected outright rather than silently doing the wrong
+    thing again."""
+    profile = _graded_flat_profile(r_max=200.0, r_min=0.01, growth=1.2)
+    sol = ImageChargeBEMSolution.solve(profile, n_max=2)
+    positions_flat = np.array([[0.5, 0.2, 0.4], [-0.3, 0.6, 0.7]])  # (2, 3), missing the group axis
+    with pytest.raises(ValueError):
+        sol.image_force(positions_flat, np.array([-1.0, -1.0]), np.array([True, True]), 0.1, 0.5, n_max=2)
+
+
+def test_image_force_groups_never_interact():
+    """The core architectural invariant this project's whole per-group
+    adaptive-stepping design rests on (see tracker.SpecificParticleTracer's
+    module docstring and forces._pairwise_force's group-preserving einsum):
+    a particle's image-charge force must depend only on the other
+    particles in *its own* emission group, never on particles in a
+    different group, however physically close they happen to be. Caught a
+    real bug this way during development: an earlier version flattened the
+    group axis away before doing the joint solve, so a second, unrelated,
+    physically distant group changed a first group's own particle's force
+    by ~14% instead of by exactly zero."""
+    from specific_particle_tracer.bem.mesh import hemisphere_tip_image_profile
+
+    R = 50e-9
+    z0 = 3e-9
+    profile = hemisphere_tip_image_profile(R, z0, 5 * R, n_theta=20, n_fillet=8, n_r=10)
+    n_max = 8
+    sol = ImageChargeBEMSolution.solve(profile, n_max=n_max)
+    d_lo, d_hi = 0.1 * R, 0.5 * R
+
+    theta1 = np.radians(15.0)
+    p1 = 1.1 * R * np.array([np.sin(theta1), 0.0, np.cos(theta1)])
+    charge1 = -1.0
+
+    positions_alone = p1.reshape(1, 1, 3)
+    F_alone = sol.image_force(
+        positions_alone, np.array([[charge1]]), np.array([[True]]), d_lo, d_hi, n_max=n_max
+    )[0, 0]
+
+    theta_far = np.radians(80.0)
+    p_far = 1.1 * R * np.array([np.sin(theta_far), 0.3, np.cos(theta_far)])
+    positions_two_groups = np.stack([positions_alone[0], np.array([p_far])], axis=0)  # (2, 1, 3)
+    charges_two = np.array([[charge1], [-2.0]])
+    active_two = np.array([[True], [True]])
+    F_two_groups = sol.image_force(positions_two_groups, charges_two, active_two, d_lo, d_hi, n_max=n_max)
+
+    assert np.array_equal(F_two_groups[0, 0], F_alone)

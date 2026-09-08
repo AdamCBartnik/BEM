@@ -228,6 +228,10 @@ The GPU/CPU crossover point (where GPU stops being a net loss) moved from
 somewhere around N~300-1000 down to N~10-20 -- worth knowing before
 assuming "GPU" automatically means "fast" for a small particle batch.
 
+(The table's N is a single group's own particle count, i.e. this measures
+G=1, E=N -- no group boundary is involved when there's only one group, so
+these numbers are unaffected by the group-isolation fix below.)
+
 A RawKernel argument gotcha worth remembering if this code is touched
 again: it receives array arguments as flat pointers with *no stride
 information*. Passing a non-contiguous view (e.g. one column of a
@@ -240,6 +244,68 @@ garbage instead of the intended column). Every array handed to
 `kernel(...)` must be made contiguous explicitly first
 (`cp.ascontiguousarray`), even if it was already a "real" array a moment
 before slicing.
+
+Groups never interact -- a bug found and fixed here
+-----------------------------------------------------
+Every other force in this project (forces._pairwise_force, which backs
+coulomb_force/image_charge_force/hemispherical_tip_image_force) treats its
+input as (n_groups, n_emit, 3) and only ever pairs particles *within* the
+same group -- the whole basis for tracker.SpecificParticleTracer's
+per-group independent adaptive stepping (see its own module docstring).
+An earlier version of `image_force` here didn't respect this: it accepted
+any leading batch shape and flattened it away before doing the joint
+solve, so two particles from *different* emission groups -- meant to be
+physically non-interacting, however close they happened to be -- would
+spuriously polarize the same patch of conductor together. Caught directly
+(not theoretically): adding a second, distant, unrelated group changed a
+first group's own particle's force by ~14%, when it should have changed
+it by exactly zero. Fixed by requiring `position` to carry the group axis
+explicitly (a bare (N, 3) now raises, rather than silently doing the wrong
+thing again) and doing the per-mode solve, field reconstruction, and
+mirror-charge cross-term all *per group* -- see `image_force`'s own
+docstring for how (batching G independent solves into one call's "many
+right-hand-sides" axis, not a Python loop over groups) and
+tests/test_bem_image_charge.py's test_image_force_groups_never_interact
+for the regression check.
+
+Cost implication and multi-process CPU scaling
+-------------------------------------------------
+Doing this correctly costs more than the bug did whenever more than one
+group shares a step: the buggy version's single shared right-hand side
+made its per-mode solve O(n_max * P^3), independent of how many groups
+were flattened together, which was cheap only because it was quietly
+ignoring group boundaries. The fixed version's cost genuinely grows with
+G (number of groups sharing a step) -- measured on this project's actual
+geometry (n_theta=20 image profile, n_max=8): ~2 ms/group at G=10,
+settling to ~6-7 ms/group by G>=50 (small-batch fixed overhead
+amortizing away, the same pattern this project's own per-group tracker
+cost already showed for the *field*-only case). For a near-surface start
+(every particle begins at rest right where the image force is strongest
+and most rapidly varying, needing many small adaptive steps to resolve),
+that per-call cost gets paid many times over a single trajectory, so it
+dominates far more than a naive "per-call cost x expected number of
+calls" estimate suggests.
+
+This is exactly where multi-process CPU parallelism (tracker.
+SpecificParticleTracer's `n_workers`, unaffected by anything in this
+module or bem.toroidal/bem.axisymmetric's GPU work -- it's a separate,
+already-existing mechanism, see parallel.py) earns its keep: splitting
+groups across worker processes doesn't just parallelize the work, it
+directly *shrinks* the G each worker's own image_force calls have to
+solve for, which is worth more than proportionally given the per-group
+cost above only fully amortizes once G is already largish. Measured
+directly (this project's own geometry, n_theta=20 image profile, n_max=8,
+n_emit=5, 50 groups sharing steps, RTX-5070-Ti-equipped machine, all on
+CPU): n_workers=1 -> 489.0s, 2 -> 165.1s (2.96x), 4 -> 90.8s (5.39x),
+8 -> 62.7s (7.79x) -- scaling at least as well as, and here somewhat
+better than, plain linear, unlike the field-only case at the same group
+count (which needs tens of thousands of groups before multi-process CPU
+parallelism clearly pays for itself, since its own per-group cost is
+much smaller to begin with -- see tracker.SpecificParticleTracer's own
+docstring). Multi-process CPU and the GPU port above are independent,
+complementary options for the same underlying cost, not alternatives to
+pick between in general -- which one wins depends on G, n_emit, n_max,
+and how many physical cores vs. how capable a GPU is available.
 """
 
 import numpy as np
@@ -384,13 +450,18 @@ def _segment_quadrature_geometry(profile, n_subdiv):
 
 
 def _interp_nodal_density(sigma, seg_index, t_local):
-    """sigma: (n_max+1, n_profile), on the same array module as seg_index/
-    t_local. Returns (n_max+1, n_quad): sigma linearly interpolated from
-    profile nodes onto quadrature points, via `_segment_quadrature_geometry`'s
-    (seg_index, t_local) -- a single vectorized gather, not a Python loop."""
-    s0 = sigma[:, seg_index]
-    s1 = sigma[:, seg_index + 1]
-    return s0 + t_local[None, :] * (s1 - s0)
+    """sigma: (..., n_profile) -- any number of leading dims (e.g.
+    (n_max+1, n_groups) for the grouped joint solve) -- on the same array
+    module as seg_index/t_local. Returns (..., n_quad): sigma linearly
+    interpolated from profile nodes onto quadrature points, via
+    `_segment_quadrature_geometry`'s (seg_index, t_local) -- a single
+    vectorized gather, not a Python loop. Indexes the *last* axis
+    explicitly (`...`), not a fixed position, so this works the same way
+    regardless of how many leading dims sigma has."""
+    s0 = sigma[..., seg_index]
+    s1 = sigma[..., seg_index + 1]
+    t = t_local.reshape((1,) * (s0.ndim - 1) + t_local.shape)
+    return s0 + t * (s1 - s0)
 
 
 def assemble_mode_operators(profile, n_max, refine_ratio=1.0, max_depth=20):
@@ -617,16 +688,34 @@ class ImageChargeBEMSolution:
         evaluations after the one shared solve, since it's a single joint
         density rather than N separate ones.
 
-        For N=1 this reduces to exactly `image_field`'s single-particle
-        answer (checked in tests/test_bem_image_charge.py) -- the cosine-
-        only rotated-frame path there is a valid special case of this one,
-        not a different approximation.
+        For a single particle alone in its own group of one, this reduces
+        to exactly `image_field`'s single-particle answer (checked in
+        tests/test_bem_image_charge.py) -- the cosine-only rotated-frame
+        path there is a valid special case of this one, not a different
+        approximation.
+
+        Groups never interact (like every other force in this project --
+        see forces._pairwise_force/coulomb_force/image_charge_force, and
+        tracker.SpecificParticleTracer's own module docstring): the joint
+        solve above is done *per group*, not across the whole batch, so a
+        particle in one group is never coupled -- through either the
+        shared residual density or the all-pairs mirror-charge sum -- to a
+        particle in another group, however physically close they happen to
+        be. This requires `position` to carry the group axis explicitly
+        (shape (n_groups, n_emit, 3), not just any leading batch shape) --
+        checked directly: introducing a second, unrelated group changes a
+        first group's own particle's force by zero, not by some small but
+        nonzero cross-term (which is what an earlier, buggy version of
+        this method that flattened away the group axis before solving
+        produced -- a real, if usually modest-sized, correctness bug,
+        since it let particles from *different* emission groups spuriously
+        polarize the same patch of conductor at once).
 
         Parameters
         ----------
-        position : array, shape (..., 3)
-        charge : array, shape (...)
-        active : bool array, shape (...)
+        position : array, shape (n_groups, n_emit, 3)
+        charge : array, shape (n_groups, n_emit)
+        active : bool array, shape (n_groups, n_emit)
         d_lo, d_hi : float
             Mirror-charge blending distances, shared by every particle.
         n_max : int, optional
@@ -646,7 +735,7 @@ class ImageChargeBEMSolution:
 
         Returns
         -------
-        force : array (xp), shape (..., 3)
+        force : array (xp), shape (n_groups, n_emit, 3)
 
         Note on exact on-axis or exact phi=0 query points: a transverse
         force component that's mathematically zero by symmetry there (the
@@ -663,75 +752,113 @@ class ImageChargeBEMSolution:
         "small-scale atol trap" this project already watches for
         elsewhere) -- not if it's just summed into a force alongside
         everything else, as the tracker does.
+
+        Cost, worth knowing before pointing this at a very large run: doing
+        this correctly (one independent solve per group) genuinely costs
+        more than the buggy flattened version did -- that version's single
+        shared right-hand side made the per-mode solve O(n_max * P^3)
+        *independent of how many groups were in the batch*, which was
+        cheap only because it was quietly doing the wrong physics (see
+        above). Solving G independent systems (even bundled into one
+        multiple-right-hand-side call, as done here) costs O(n_max * (P^3
+        + P^2*G)) instead, and the RHS-assembly intermediate arrays scale
+        as O(n_max * G * n_emit * n_profile). For this project's typical
+        n_emit (small -- a handful to a few tens of particles actually
+        close enough in time/space to be worth coupling at all) this is a
+        modest, correctness-mandated cost, not a surprise -- but a run
+        with a very large number of groups sharing a step at once (this
+        project's own multi-process benchmarking has exercised tens of
+        thousands) and a generous n_max could use real memory. Not chunked
+        here.
         """
         position_xp = _to_xp(position, xp, dtype=float)
         charge_xp = _to_xp(charge, xp, dtype=float)
         active_xp = _to_xp(active, xp, dtype=bool)
 
-        shape = position_xp.shape
-        flat_pos = position_xp.reshape(-1, 3)
-        flat_charge = charge_xp.reshape(-1)
-        flat_active = active_xp.reshape(-1)
-
-        force = xp.zeros_like(flat_pos)
-        idx = xp.nonzero(flat_active)[0]
-        if idx.size == 0:
-            return force.reshape(shape)
-
+        if position_xp.ndim != 3 or position_xp.shape[-1] != 3:
+            raise ValueError(
+                "position must have shape (n_groups, n_emit, 3) -- groups must stay "
+                f"explicit so they can be solved independently (got shape {position_xp.shape})"
+            )
+        G, E, _ = position_xp.shape
         n_max = self.n_max if n_max is None else n_max
 
-        pos = flat_pos[idx]
-        q = flat_charge[idx]
-        x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
+        # Inactive particles contribute nothing to their group's induced
+        # response or to the all-pairs mirror sum (same masking convention
+        # as forces._pairwise_force), and get zero force at the end.
+        q_eff = xp.where(active_xp, charge_xp, 0.0)  # (G, E)
+
+        x, y, z = position_xp[..., 0], position_xp[..., 1], position_xp[..., 2]
         rho = xp.hypot(x, y)
         phi = xp.arctan2(y, x)
         rho_safe = xp.maximum(rho, self._rho_floor)
 
-        closest, tangent_unit, normal_unit, dist = self._closest_points_batch(rho_safe, z, xp=xp)
+        # Closest-point/mirror-point geometry is purely per-particle (it
+        # doesn't depend on any other particle or which group it's in), so
+        # this part can stay flattened across the whole (G, E) batch.
+        closest, tangent_unit, normal_unit, dist = self._closest_points_batch(
+            rho_safe.reshape(-1), z.reshape(-1), xp=xp
+        )
         if d_hi > d_lo:
             w = image_charge_weight(dist, d_lo, d_hi, xp=xp)
         else:
             w = xp.zeros_like(dist)
+        rho_img, z_img, side = mirror_points_batch(
+            rho_safe.reshape(-1), z.reshape(-1), closest, tangent_unit, normal_unit, xp=xp
+        )
+        phi_img = xp.where(side > 0, phi.reshape(-1), phi.reshape(-1) + xp.pi)
+        q_img = -q_eff.reshape(-1) * w
+        rho_img, z_img, phi_img, q_img = (a.reshape(G, E) for a in (rho_img, z_img, phi_img, q_img))
 
-        rho_img, z_img, side = mirror_points_batch(rho_safe, z, closest, tangent_unit, normal_unit, xp=xp)
-        phi_img = xp.where(side > 0, phi, phi + xp.pi)
-        q_img = -q * w
-
-        profile_rho = _to_xp(np.maximum(self.profile[:, 0], self._rho_floor), xp)
-        profile_z = _to_xp(self.profile[:, 1], xp)
+        profile_rho = _to_xp(np.maximum(self.profile[:, 0], self._rho_floor), xp)  # (P,)
+        profile_z = _to_xp(self.profile[:, 1], xp)  # (P,)
+        P = len(self.profile)
         m = xp.arange(n_max + 1, dtype=float)
 
         def _rhs_contribution(source_rho, source_z, source_phi, source_charge):
+            # source_* : (G, E). Returns (g_c, g_s), each (n_max+1, G, P) --
+            # summed over E (within-group only), keeping G as its own axis
+            # so different groups' excitations never mix.
             g = point_charge_potential_modes(
-                profile_rho[None, :], profile_z[None, :], source_rho[:, None], source_z[:, None], n_max, xp=xp
-            )  # (n_max+1, N, n_profile)
-            cos_phi = xp.cos(m[:, None] * source_phi[None, :])  # (n_max+1, N)
-            sin_phi = xp.sin(m[:, None] * source_phi[None, :])
-            weighted = source_charge[None, :, None] * g  # (n_max+1, N, n_profile)
-            g_c = xp.sum(weighted * cos_phi[:, :, None], axis=1)  # (n_max+1, n_profile)
-            g_s = xp.sum(weighted * sin_phi[:, :, None], axis=1)
+                profile_rho[None, None, :], profile_z[None, None, :],
+                source_rho[:, :, None], source_z[:, :, None], n_max, xp=xp,
+            )  # (n_max+1, G, E, P)
+            cos_phi = xp.cos(m[:, None, None] * source_phi[None, :, :])  # (n_max+1, G, E)
+            sin_phi = xp.sin(m[:, None, None] * source_phi[None, :, :])
+            weighted = source_charge[None, :, :, None] * g  # (n_max+1, G, E, P)
+            g_c = xp.sum(weighted * cos_phi[:, :, :, None], axis=2)  # (n_max+1, G, P)
+            g_s = xp.sum(weighted * sin_phi[:, :, :, None], axis=2)
             return g_c, g_s
 
-        g_real_c, g_real_s = _rhs_contribution(rho_safe, z, phi, q)
+        g_real_c, g_real_s = _rhs_contribution(rho_safe, z, phi, q_eff)
         g_img_c, g_img_s = _rhs_contribution(rho_img, z_img, phi_img, q_img)
+        rhs_c = -(g_real_c + g_img_c)  # (n_max+1, G, P)
+        rhs_s = -(g_real_s + g_img_s)
 
-        rhs = -xp.stack([g_real_c + g_img_c, g_real_s + g_img_s], axis=-1)  # (n_max+1, n_profile, 2)
-        A = _to_xp(self.A[: n_max + 1, : len(self.profile), : len(self.profile)], xp)
-        sigma = xp.linalg.solve(A, rhs)  # (n_max+1, n_profile, 2)
+        # Every group shares the SAME operator A (geometry-only) but needs
+        # its OWN solve -- rather than broadcasting A across a new G axis
+        # (which would mean G copies of an (n_max+1, P, P) array), put
+        # (group, cos/sin) into the "many right-hand-sides" trailing axis
+        # of one ordinary batched solve, matching xp.linalg.solve's native
+        # (..., M, M), (..., M, K) form with no replication of A at all.
+        rhs = xp.stack([rhs_c, rhs_s], axis=-1)  # (n_max+1, G, P, 2)
+        rhs = xp.moveaxis(rhs, 1, 2).reshape(n_max + 1, P, G * 2)  # (n_max+1, P, G*2)
+        A = _to_xp(self.A[: n_max + 1, :P, :P], xp)
+        sigma = xp.linalg.solve(A, rhs)  # (n_max+1, P, G*2)
+        sigma = xp.moveaxis(sigma.reshape(n_max + 1, P, G, 2), 1, 2)  # (n_max+1, G, P, 2)
         sigma_C, sigma_S = sigma[..., 0], sigma[..., 1]
 
         E_residual = self._field_from_joint_mode_density_batch(
             sigma_C, sigma_S, rho_safe, phi, z, n_max, xp=xp, n_subdiv=n_subdiv
-        )
+        )  # (G, E, 3)
 
-        query_xyz = _cylindrical_to_cartesian(rho_safe, phi, z, xp=xp)
-        mirror_xyz = _cylindrical_to_cartesian(rho_img, phi_img, z_img, xp=xp)
-        E_mirror = _point_charge_field_batch_all_pairs(query_xyz, mirror_xyz, q_img, xp=xp)
+        query_xyz = _cylindrical_to_cartesian(rho_safe, phi, z, xp=xp)  # (G, E, 3)
+        mirror_xyz = _cylindrical_to_cartesian(rho_img, phi_img, z_img, xp=xp)  # (G, E, 3)
+        E_mirror = _point_charge_field_batch_all_pairs(query_xyz, mirror_xyz, q_img, xp=xp)  # (G, E, 3)
 
         E_total = (E_residual + E_mirror) / VACUUM_PERMITTIVITY
-        force[idx] = q[:, None] * E_total
-
-        return force.reshape(shape)
+        force = q_eff[..., None] * E_total
+        return xp.where(active_xp[..., None], force, 0.0)
 
     def _field_from_mode_density(self, sigma_m, rho, phi, z, n_max):
         """Field E = -grad[S[sum_m sigma_m*cos(m*phi')]] at (rho, phi, z),
@@ -771,28 +898,33 @@ class ImageChargeBEMSolution:
 
     def _field_from_joint_mode_density_batch(self, sigma_C, sigma_S, rho_q, phi_q, z_q, n_max, xp=np, n_subdiv=4):
         """Vectorized generalization of the single-particle field
-        reconstruction to (a) many query points at once (shape (Nq,)
-        arrays) and (b) a *joint* density with both a cos(m*phi') part
-        (sigma_C) and a sin(m*phi') part (sigma_S) -- needed once source
-        particles sit at different, arbitrary azimuths (see `image_force`'s
-        module-docstring-referenced derivation), unlike the single-particle
-        `image_field`'s path, which gets away with a cosine-only series by
-        always rotating the one source to phi'=0 first.
+        reconstruction to (a) many query points at once, grouped (shape
+        (G, E) arrays, one independent density per group -- see
+        `image_force`'s group-isolation requirement) and (b) a *joint*
+        density with both a cos(m*phi') part (sigma_C) and a sin(m*phi')
+        part (sigma_S) -- needed once source particles sit at different,
+        arbitrary azimuths (see `image_force`'s module-docstring-referenced
+        derivation), unlike the single-particle `image_field`'s path,
+        which gets away with a cosine-only series by always rotating the
+        one source to phi'=0 first.
 
-        A single (n_max+1, Nq, n_quad) broadcast over the fixed quadrature
-        from `_quadrature_geometry` -- no Python loop over profile segments
-        (earlier versions of this method had one; see
+        A single (n_max+1, G, E, n_quad) broadcast over the fixed
+        quadrature from `_quadrature_geometry` -- no Python loop over
+        profile segments (earlier versions of this method had one; see
         `_segment_quadrature_geometry`'s docstring) -- so this is both
         faster on CPU and, more importantly, GPU-friendly: one batch of
         array ops instead of one Python-level (hence one round of kernel
         launches) iteration per segment.
 
-        sigma_C, sigma_S : shape (n_max+1, n_profile), on xp.
-        rho_q, phi_q, z_q : shape (Nq,), on xp.
+        sigma_C, sigma_S : shape (n_max+1, G, n_profile), on xp -- group g's
+            query points are only ever evaluated against group g's own
+            solved density (never another group's), which is what keeps
+            groups from cross-coupling here.
+        rho_q, phi_q, z_q : shape (G, E), on xp.
 
         Returns
         -------
-        E : array (xp), shape (Nq, 3)
+        E : array (xp), shape (G, E, 3)
         """
         rho_quad_np, z_quad_np, seg_len_np, seg_index_np, t_local_np = self._quadrature_geometry(n_subdiv)
         rho_quad = _to_xp(rho_quad_np, xp)
@@ -801,31 +933,31 @@ class ImageChargeBEMSolution:
         seg_index = _to_xp(seg_index_np, xp)
         t_local = _to_xp(t_local_np, xp)
 
-        dens_c = _interp_nodal_density(sigma_C, seg_index, t_local)  # (n_max+1, n_quad)
+        dens_c = _interp_nodal_density(sigma_C, seg_index, t_local)  # (n_max+1, G, n_quad)
         dens_s = _interp_nodal_density(sigma_S, seg_index, t_local)
-        weight_c = dens_c * seg_len[None, :]
-        weight_s = dens_s * seg_len[None, :]
+        weight_c = dens_c * seg_len[None, None, :]
+        weight_s = dens_s * seg_len[None, None, :]
 
-        # (n_max+1, Nq, n_quad): every query point against every quadrature
-        # node at once.
+        # (n_max+1, G, E, n_quad): every (group, query-within-group) point
+        # against every quadrature node of that *same* group's density.
         Phi, dPhi_drho, dPhi_dz = ring_field_modes(
-            rho_q[:, None], z_q[:, None], rho_quad[None, :], z_quad[None, :], n_max, xp=xp
+            rho_q[:, :, None], z_q[:, :, None], rho_quad[None, None, :], z_quad[None, None, :], n_max, xp=xp
         )
 
-        e_rho_c = xp.sum(-weight_c[:, None, :] * dPhi_drho, axis=-1)  # (n_max+1, Nq)
-        e_rho_s = xp.sum(-weight_s[:, None, :] * dPhi_drho, axis=-1)
-        e_z_c = xp.sum(-weight_c[:, None, :] * dPhi_dz, axis=-1)
-        e_z_s = xp.sum(-weight_s[:, None, :] * dPhi_dz, axis=-1)
+        e_rho_c = xp.sum(-weight_c[:, :, None, :] * dPhi_drho, axis=-1)  # (n_max+1, G, E)
+        e_rho_s = xp.sum(-weight_s[:, :, None, :] * dPhi_drho, axis=-1)
+        e_z_c = xp.sum(-weight_c[:, :, None, :] * dPhi_dz, axis=-1)
+        e_z_s = xp.sum(-weight_s[:, :, None, :] * dPhi_dz, axis=-1)
 
         m = xp.arange(n_max + 1, dtype=float)
-        m_over_rho = m[:, None, None] / rho_q[None, :, None]  # (n_max+1, Nq, 1)
-        e_phi_amp_c = xp.sum(weight_c[:, None, :] * Phi * m_over_rho, axis=-1)
-        e_phi_amp_s = xp.sum(weight_s[:, None, :] * Phi * m_over_rho, axis=-1)
+        m_over_rho = (m[:, None, None] / rho_q[None, :, :])[..., None]  # (n_max+1, G, E, 1)
+        e_phi_amp_c = xp.sum(weight_c[:, :, None, :] * Phi * m_over_rho, axis=-1)
+        e_phi_amp_s = xp.sum(weight_s[:, :, None, :] * Phi * m_over_rho, axis=-1)
 
-        cos_m_phi = xp.cos(m[:, None] * phi_q[None, :])  # (n_max+1, Nq)
-        sin_m_phi = xp.sin(m[:, None] * phi_q[None, :])
+        cos_m_phi = xp.cos(m[:, None, None] * phi_q[None, :, :])  # (n_max+1, G, E)
+        sin_m_phi = xp.sin(m[:, None, None] * phi_q[None, :, :])
 
-        E_rho = xp.sum(e_rho_c * cos_m_phi + e_rho_s * sin_m_phi, axis=0)
+        E_rho = xp.sum(e_rho_c * cos_m_phi + e_rho_s * sin_m_phi, axis=0)  # (G, E)
         E_z = xp.sum(e_z_c * cos_m_phi + e_z_s * sin_m_phi, axis=0)
         E_phi = xp.sum(e_phi_amp_c * sin_m_phi - e_phi_amp_s * cos_m_phi, axis=0)
 
@@ -853,25 +985,29 @@ def _cylindrical_to_cartesian(rho, phi, z, xp=np):
 
 
 def _point_charge_field_batch_all_pairs(query_xyz, source_xyz, source_charge, xp=np):
-    """Ordinary Coulomb field (G = 1/(4*pi*r)) at each of N query points due
-    to the sum of M point charges -- the all-pairs (N, M) cross term needed
-    when adding every particle's own local mirror charge back (see
-    `ImageChargeBEMSolution.image_force`'s "cross" step): particle i feels
-    the direct field of *every* active particle's mirror charge, including
-    its own (j=i, which reduces to the single-particle self-image term).
+    """Ordinary Coulomb field (G = 1/(4*pi*r)) at each of E query points in
+    each of G groups, due to the sum of the E mirror charges *in that same
+    group* -- the within-group-only all-pairs cross term needed when
+    adding every particle's own local mirror charge back (see
+    `ImageChargeBEMSolution.image_force`'s "cross" step): particle i in
+    group g feels the direct field of every active particle's mirror
+    charge in group g, including its own (j=i, which reduces to the
+    single-particle self-image term) -- never a particle in a different
+    group (matching `forces._pairwise_force`'s own "gij,gijc->gic"
+    group-preserving einsum, which this mirrors).
 
     Parameters
     ----------
-    query_xyz : array, shape (N, 3)
-    source_xyz : array, shape (M, 3)
-    source_charge : array, shape (M,)
+    query_xyz : array, shape (G, E, 3)
+    source_xyz : array, shape (G, E, 3)
+    source_charge : array, shape (G, E)
 
     Returns
     -------
-    E : array, shape (N, 3)
+    E : array, shape (G, E, 3)
     """
-    diff = query_xyz[:, None, :] - source_xyz[None, :, :]  # (N, M, 3)
-    r = xp.linalg.norm(diff, axis=-1)  # (N, M)
+    diff = query_xyz[:, :, None, :] - source_xyz[:, None, :, :]  # (G, E, E, 3)
+    r = xp.linalg.norm(diff, axis=-1)  # (G, E, E)
     r_safe = xp.where(r > 0.0, r, 1.0)
-    coeff = xp.where(r > 0.0, source_charge[None, :] / (4.0 * xp.pi * r_safe**3), 0.0)
-    return xp.einsum("nm,nmc->nc", coeff, diff)
+    coeff = xp.where(r > 0.0, source_charge[:, None, :] / (4.0 * xp.pi * r_safe**3), 0.0)
+    return xp.einsum("gnm,gnmc->gnc", coeff, diff)
