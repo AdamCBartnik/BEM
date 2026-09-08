@@ -107,29 +107,11 @@ trick instead), so the lack of adaptivity here doesn't cost accuracy.
 
 import numpy as np
 
+from ._elliptic import ellip_ke as _ellip_ke
+
 # 3-point (not the solve's 4-point) fixed Gauss-Legendre rule used per
 # quadrature sub-panel in the cached field-evaluation quadrature.
 _GAUSS_X, _GAUSS_W = np.polynomial.legendre.leggauss(4)
-
-
-def _ellip_ke(m, xp):
-    """(K(m), E(m)), the complete elliptic integrals of the first and
-    second kind, to full double precision on either backend.
-
-    numpy: scipy.special.ellipk/ellipe directly. cupy: cupyx.scipy.special
-    provides ellipk but not ellipe (as of this writing) -- E(m) instead
-    comes from the incomplete elliptic integral of the second kind at its
-    upper limit pi/2, ellipeinc(pi/2, m), which *is* the complete integral
-    by definition (confirmed to match scipy.special.ellipe to within
-    2e-16, i.e. floating-point roundoff, not an approximation)."""
-    if xp is np:
-        from scipy import special
-
-        return special.ellipk(m), special.ellipe(m)
-
-    from cupyx.scipy import special as cupy_special
-
-    return cupy_special.ellipk(m), cupy_special.ellipeinc(xp.pi / 2, m)
 
 
 def ring_potential(rho, z, a, xp=np):

@@ -1,6 +1,6 @@
 """Example: the axisymmetric BEM solver for a hemispherical-tip cathode.
 
-Two parts:
+Three parts:
 1. Solve the field with bem.fields.HemisphericalTipBEMField and compare it
    directly to the closed-form fields.HemisphericalTipField.
 2. Push a handful of particles (zero initial velocity, no image-charge or
@@ -13,6 +13,15 @@ Two parts:
    numerical story behind this solver (indirect/charge-simulation BEM,
    reduced to a 1D axisymmetric problem via elliptic integrals, fully
    vectorized -- runs on numpy or, for large particle counts, cupy).
+3. Turn the image-charge force on (bem.geometry.HemisphericalTipBEMGeometry's
+   `z0` argument) and compare its BEM-computed image force -- an azimuthal-
+   Fourier-mode BEM solve on the recessed image surface, see
+   bem/image_charge.py's module docstring -- against this project's exact
+   closed-form 3-image solution for this same hemisphere-on-plane shape
+   (forces.hemispherical_tip_image_force). This shape has that exact
+   solution already, so the BEM path isn't the better choice *here* --
+   this comparison exists to validate the general (image-force-capable)
+   machinery a genuinely non-spherical tip shape would actually need.
 """
 
 import time
@@ -106,3 +115,40 @@ run("BEM (cpu)", HemisphericalTipBEMGeometry(E_gun, R, n_theta=40))
 # crossover point measured on this project's own hardware):
 #
 #     run("BEM (gpu)", HemisphericalTipBEMGeometry(E_gun, R, n_theta=40), backend="gpu")
+
+# --- Part 3: image-charge force, BEM vs. the exact 3-image analytic form --
+
+from specific_particle_tracer.forces import hemispherical_tip_image_force  # noqa: E402
+from specific_particle_tracer.geometry import DEFAULT_Z0  # noqa: E402
+
+print(f"\nBuilding the image-charge BEM solve (z0={DEFAULT_Z0:.1e} m) -- this is the")
+print("expensive one-time step (a per-mode adaptive-quadrature operator")
+print("assembly, not a cheap linear solve): tens of seconds to a few minutes")
+print("depending on image_n_theta/n_fillet/n_r.")
+
+bem_geom_with_image = HemisphericalTipBEMGeometry(
+    E_gun, R, n_theta=40, z0=DEFAULT_Z0, image_n_theta=30, image_n_fillet=12, image_n_r=15, image_n_max=16
+)
+
+print("\nImage-charge force, BEM vs. exact 3-image analytic (this shape has an")
+print("exact solution already -- this is a validation, not a use case). One")
+print("particle at a time on purpose: bem.image_charge's image_force treats")
+print("each particle's induced response independently (its own self-image")
+print("only), unlike hemispherical_tip_image_force's all-pairs treatment --")
+print("so with >1 particle active at once the two would legitimately differ")
+print("by the (real, but not modeled here yet) particle-particle coupling")
+print("mediated by the conductor -- see bem/image_charge.py's image_force")
+print("docstring.")
+for theta_deg, d_over_R in [(5.0, 0.1), (20.0, 0.1)]:
+    theta = np.radians(theta_deg)
+    position = (1 + d_over_R) * R * np.array([np.sin(theta), 0.0, np.cos(theta)])
+    charge = np.array([-ELEMENTARY_CHARGE])
+    active = np.array([True])
+
+    F_bem = bem_geom_with_image.image_force(position.reshape(1, 3), charge, active, plummer_radius=1e-12)[0]
+    F_exact = hemispherical_tip_image_force(
+        position.reshape(1, 1, 3), charge.reshape(1, 1), active.reshape(1, 1), R - DEFAULT_Z0, plummer_radius=1e-12
+    )[0, 0]
+
+    rel_err = np.linalg.norm(F_bem - F_exact) / np.linalg.norm(F_exact)
+    print(f"  theta={theta_deg:5.1f} deg  d/R={d_over_R:.2f}   |F_bem|={np.linalg.norm(F_bem):.4e} N   rel_err={rel_err:.2%}")
