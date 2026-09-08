@@ -62,3 +62,29 @@ def test_toroidal_Q_is_vectorized_over_chi():
     for i, c in enumerate(chi):
         q_single, _ = toroidal_Q(np.array([c]), n_max=10)
         assert np.allclose(q[:, i], q_single[:, 0], rtol=1e-10)
+
+
+def test_toroidal_Q_stays_finite_at_near_coincidence():
+    """The ratio-based recursion should never overflow no matter how close
+    chi gets to 1 (unlike a value-tracking downward recursion, which needs
+    thousands of padding steps -- each multiplying by ~2*n*chi -- before
+    the final rescale-to-a-known-value fixes the overall scale, and can
+    overflow float64 well before reaching it). Exercises exactly the
+    near-coincidence regime bem.image_charge's adaptive self-term
+    quadrature approaches."""
+    for eps in [1e-2, 1e-6, 1e-10, 1e-13]:
+        q, dq = toroidal_Q(np.array([1.0 + eps]), n_max=30)
+        assert np.all(np.isfinite(q))
+        assert np.all(np.isfinite(dq))
+        assert q[0, 0] > 0.0
+
+
+def test_toroidal_Q_n_max_zero_still_gets_correct_derivative():
+    """n_max=0 needs Q_{1/2} internally (Q_{-3/2} = Q_{1/2} by symmetry,
+    for the n=0 derivative) even though it's never returned -- regression
+    check for the M = max(n_max, 1) bookkeeping."""
+    chi = np.array([1.3, 2.5])
+    q0, dq0 = toroidal_Q(chi, n_max=0)
+    q_full, dq_full = toroidal_Q(chi, n_max=3)
+    assert np.allclose(q0[0], q_full[0])
+    assert np.allclose(dq0[0], dq_full[0])

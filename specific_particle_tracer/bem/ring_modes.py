@@ -54,6 +54,16 @@ import numpy as np
 from .toroidal import toroidal_Q
 
 
+def _chi(rho, z, a, za):
+    """chi = (rho^2 + a^2 + (z-za)^2) / (2*rho*a), computed as
+    1 + [(rho-a)^2 + (z-za)^2] / (2*rho*a) instead -- algebraically
+    identical, but avoids the near-coincidence cancellation of the naive
+    form (rho^2+a^2 nearly cancelling -2*rho*a when rho~a), which is
+    exactly what pushed chi slightly below its true minimum of 1 and
+    required toroidal_Q's clip guard in the first place."""
+    return 1.0 + ((rho - a) ** 2 + (z - za) ** 2) / (2.0 * rho * a)
+
+
 def _mode_prefactors(n_max, xp):
     c = xp.full(n_max + 1, 1.0 / (2.0 * xp.pi**2))
     c[0] = 1.0 / (4.0 * xp.pi**2)
@@ -71,7 +81,7 @@ def ring_potential_modes(rho, z, a, za, n_max, xp=np):
     rho, z, a, za = xp.broadcast_arrays(
         *(xp.asarray(v, dtype=float) for v in (rho, z, a, za))
     )
-    chi = (rho**2 + a**2 + (z - za) ** 2) / (2.0 * rho * a)
+    chi = _chi(rho, z, a, za)
     q, _ = toroidal_Q(chi, n_max, xp=xp)
     return xp.sqrt(a / rho)[None, ...] * q / (2.0 * xp.pi)
 
@@ -92,7 +102,7 @@ def ring_field_modes(rho, z, a, za, n_max, xp=np):
     rho, z, a, za = xp.broadcast_arrays(
         *(xp.asarray(v, dtype=float) for v in (rho, z, a, za))
     )
-    chi = (rho**2 + a**2 + (z - za) ** 2) / (2.0 * rho * a)
+    chi = _chi(rho, z, a, za)
     q, dq = toroidal_Q(chi, n_max, xp=xp)
 
     dchi_drho = (rho**2 - a**2 - (z - za) ** 2) / (2.0 * a * rho**2)
@@ -116,7 +126,7 @@ def point_charge_potential_modes(rho, z, rho0, z0, n_max, xp=np):
     rho, z, rho0, z0 = xp.broadcast_arrays(
         *(xp.asarray(v, dtype=float) for v in (rho, z, rho0, z0))
     )
-    chi = (rho**2 + rho0**2 + (z - z0) ** 2) / (2.0 * rho * rho0)
+    chi = _chi(rho, z, rho0, z0)
     q, _ = toroidal_Q(chi, n_max, xp=xp)
     c = _mode_prefactors(n_max, xp)
     shape = (n_max + 1,) + (1,) * rho.ndim
