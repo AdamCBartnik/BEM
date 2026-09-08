@@ -93,11 +93,17 @@ class HemisphericalTipBEMGeometry(geometry_module.Geometry):
     kill_z_below : float or None, optional
         Same meaning as `geometry.HemisphericalTip`'s.
     xp : module, optional
-        numpy or cupy. The BEM solve always runs on numpy/CPU regardless
-        of what's passed here (matching `HemisphericalTipBEMField`), but
-        `field`'s evaluation runs on this backend -- the tracker rebuilds
-        this Geometry via `worker_args`/`from_worker_args` on whatever
-        backend it's actually using, which re-solves the BEM problem from
+        numpy or cupy. Both BEM solves (static-field and, if `z0` is not
+        None, image-charge) always run their one-time operator assembly
+        on numpy/CPU regardless of what's passed here (matching
+        `HemisphericalTipBEMField`) -- but `field`'s and `image_force`'s
+        per-call evaluation both run on this backend, including
+        `image_force`'s own per-mode linear solve (see
+        `bem.image_charge.ImageChargeBEMSolution.image_force`'s docstring
+        for the GPU-specific machinery -- custom RawKernels for its two
+        Python-loop hot spots -- this enables). The tracker rebuilds this
+        Geometry via `worker_args`/`from_worker_args` on whatever backend
+        it's actually using, which re-solves the BEM problem(s) from
         scratch (see `worker_args`'s docstring below for the cost this
         implies).
     """

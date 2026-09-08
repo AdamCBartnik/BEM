@@ -168,3 +168,15 @@ F_exact_pair = hemispherical_tip_image_force(
 for i in range(2):
     rel_err = np.linalg.norm(F_bem_pair[i] - F_exact_pair[i]) / np.linalg.norm(F_exact_pair[i])
     print(f"  particle {i}: |F_bem|={np.linalg.norm(F_bem_pair[i]):.4e} N   rel_err={rel_err:.2%}")
+
+# image_force (unlike the one-time operator assembly above) runs on
+# whatever backend the Geometry was built with, including custom
+# RawKernels for its two GPU-hostile Python loops -- see
+# bem/image_charge.py's module docstring for the measured crossover point
+# (worth a few hundred to a few thousand simultaneously active particles
+# before GPU actually wins over CPU for this specific operation):
+#
+#     bem_geom_gpu = HemisphericalTipBEMGeometry(
+#         E_gun, R, n_theta=40, z0=DEFAULT_Z0, image_n_max=16, xp=cupy
+#     )
+#     force_gpu = bem_geom_gpu.image_force(positions_pair, charges_pair, active_pair, plummer_radius=1e-12)

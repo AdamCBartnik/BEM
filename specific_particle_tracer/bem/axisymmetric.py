@@ -113,6 +113,126 @@ from ._elliptic import ellip_ke as _ellip_ke
 # quadrature sub-panel in the cached field-evaluation quadrature.
 _GAUSS_X, _GAUSS_W = np.polynomial.legendre.leggauss(4)
 
+_CLOSEST_POINT_KERNEL_SOURCE = r"""
+extern "C" __global__
+void closest_point_on_profile(
+    const double* rho, const double* z,
+    const double* p0x, const double* p0y, const double* abx, const double* aby,
+    const double* nx, const double* ny,
+    int n_seg, long long n_points,
+    double* best_dist2, long long* best_seg, double* best_t, double* best_nx, double* best_ny)
+{
+    long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= n_points) return;
+
+    double rq = rho[idx], zq = z[idx];
+    double bd2 = 1.0e300;
+    long long bseg = 0;
+    double bt = 0.0, bnx = 0.0, bny = 0.0;
+
+    for (int j = 0; j < n_seg; j++) {
+        double ax = abx[j], ay = aby[j];
+        double ab_dot_ab = ax * ax + ay * ay;
+        double t = ((rq - p0x[j]) * ax + (zq - p0y[j]) * ay) / ab_dot_ab;
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+        double crho = p0x[j] + t * ax;
+        double cz = p0y[j] + t * ay;
+        double drho = rq - crho, dz = zq - cz;
+        double d2 = drho * drho + dz * dz;
+        if (d2 < bd2) {
+            bd2 = d2;
+            bseg = j;
+            bt = t;
+            bnx = nx[j];
+            bny = ny[j];
+        }
+    }
+    best_dist2[idx] = bd2;
+    best_seg[idx] = bseg;
+    best_t[idx] = bt;
+    best_nx[idx] = bnx;
+    best_ny[idx] = bny;
+}
+"""
+
+_closest_point_kernel = None
+
+
+def _get_closest_point_kernel():
+    global _closest_point_kernel
+    if _closest_point_kernel is None:
+        import cupy as cp
+
+        _closest_point_kernel = cp.RawKernel(_CLOSEST_POINT_KERNEL_SOURCE, "closest_point_on_profile")
+    return _closest_point_kernel
+
+
+def _closest_point_on_profile_gpu(rho, z, p0, p1, tangent, normal):
+    """Same contract as `_closest_point_on_profile`, but as a single
+    cupy.RawKernel launch: one CUDA thread per query point, looping over
+    all n_segments profile segments in device code, instead of the
+    Python-loop version's O(n_segments) rounds of tiny elementwise kernel
+    launches (clip, compare, `xp.where` x3) over the whole query-point
+    array each time -- measured to dominate this function's GPU cost even
+    at query-point counts as small as 10 (the per-segment loop count, not
+    the query-point count, drives the number of kernel launches). No
+    upper bound on n_segments here (unlike bem.toroidal's RawKernel, which
+    needs a fixed-size per-thread local array for its mode count): each
+    thread just reads the (small, read-only, effectively L1/L2-cached)
+    profile-geometry arrays directly, no local storage sized by n_seg."""
+    import cupy as cp
+
+    n_points = rho.shape[0]
+    n_seg = len(p0)
+    p0 = cp.asarray(p0, dtype=cp.float64)
+    tangent = cp.asarray(tangent, dtype=cp.float64)
+    normal = cp.asarray(normal, dtype=cp.float64)
+    # Each column of a (n_seg, 2) C-order array is a stride-2 view, not a
+    # contiguous buffer -- a RawKernel argument is just a raw pointer with
+    # no stride information, so an implicitly-strided view here would read
+    # silently-wrong (shuffled) data instead of raising. Every column
+    # passed to the kernel below must be made contiguous explicitly.
+    p0x, p0y = cp.ascontiguousarray(p0[:, 0]), cp.ascontiguousarray(p0[:, 1])
+    abx, aby = cp.ascontiguousarray(tangent[:, 0]), cp.ascontiguousarray(tangent[:, 1])
+    nx, ny = cp.ascontiguousarray(normal[:, 0]), cp.ascontiguousarray(normal[:, 1])
+    rho_c = cp.ascontiguousarray(rho.astype(cp.float64, copy=False))
+    z_c = cp.ascontiguousarray(z.astype(cp.float64, copy=False))
+
+    best_dist2 = cp.empty(n_points, dtype=cp.float64)
+    best_seg = cp.empty(n_points, dtype=cp.int64)
+    best_t = cp.empty(n_points, dtype=cp.float64)
+    best_nx = cp.empty(n_points, dtype=cp.float64)
+    best_ny = cp.empty(n_points, dtype=cp.float64)
+
+    if n_points > 0:
+        threads = 256
+        blocks = (n_points + threads - 1) // threads
+        kernel = _get_closest_point_kernel()
+        kernel(
+            (blocks,),
+            (threads,),
+            (
+                rho_c,
+                z_c,
+                p0x,
+                p0y,
+                abx,
+                aby,
+                nx,
+                ny,
+                np.int32(n_seg),
+                np.int64(n_points),
+                best_dist2,
+                best_seg,
+                best_t,
+                best_nx,
+                best_ny,
+            ),
+        )
+    best_normal = cp.stack([best_nx, best_ny], axis=-1)
+    return best_dist2, best_seg, best_t, best_normal
+
 
 def ring_potential(rho, z, a, xp=np):
     """Potential at cylindrical (rho, z) of a unit-total-charge ring of
@@ -231,7 +351,11 @@ def _closest_point_on_profile(rho, z, p0, p1, tangent, normal, xp):
     field points: loops over the (few tens of) profile segments, fully
     vectorized over the (possibly many) field points within each
     iteration -- so cost is O(n_segments) Python-level iterations
-    regardless of how many field points there are.
+    regardless of how many field points there are. On GPU this Python-loop
+    cost (each iteration launching several tiny elementwise kernels) is
+    what actually dominates at typical (tens) query-point counts -- see
+    `_closest_point_on_profile_gpu`'s docstring -- so this dispatches to
+    that fused single-kernel version whenever xp is cupy.
 
     Parameters
     ----------
@@ -246,6 +370,9 @@ def _closest_point_on_profile(rho, z, p0, p1, tangent, normal, xp):
     best_dist2, best_seg, best_t : arrays, shape (M,)
     best_normal : array, shape (M, 2)
     """
+    if xp is not np:
+        return _closest_point_on_profile_gpu(rho, z, p0, p1, tangent, normal)
+
     M = rho.shape[0]
     best_dist2 = xp.full(M, xp.inf)
     best_seg = xp.zeros(M, dtype=xp.int64)

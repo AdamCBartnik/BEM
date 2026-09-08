@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from specific_particle_tracer.bem.image_charge import (
     ImageChargeBEMSolution,
@@ -186,7 +187,15 @@ def test_image_force_batch_matches_single_particle_image_field():
     machine precision; a naive component-wise comparison right at them
     fails only because it's effectively comparing two near-zero noise
     floors to each other -- the same "small-scale atol trap" this
-    project's own conventions warn about elsewhere)."""
+    project's own conventions warn about elsewhere).
+
+    n_subdiv=1 explicitly: image_force's field-reconstruction quadrature
+    defaults to n_subdiv=4 (finer than image_field's -- effectively
+    n_subdiv=1 -- own per-segment quadrature), which is a genuine (if
+    tiny, ~1e-8 relative here) refinement, not a bug (checked directly:
+    the two match to 0.0 exactly at n_subdiv=1). Pinning n_subdiv=1 here
+    keeps this test's job -- confirming N=1 batched reduces to exactly the
+    single-particle math -- distinct from a quadrature-refinement check."""
     from specific_particle_tracer.bem.mesh import hemisphere_tip_image_profile
 
     R = 50e-9
@@ -205,13 +214,13 @@ def test_image_force_batch_matches_single_particle_image_field():
     charges = np.array([[-1.0, -1.0]])
     active = np.array([[True, False]])
 
-    force = sol.image_force(positions, charges, active, d_lo=0.1 * R, d_hi=0.5 * R, n_max=n_max)
+    force = sol.image_force(positions, charges, active, d_lo=0.1 * R, d_hi=0.5 * R, n_max=n_max, n_subdiv=1)
 
     assert force.shape == positions.shape
     assert np.all(force[0, 1] == 0.0)
 
     expected0 = charges[0, 0] * sol.image_field(positions[0, 0], charges[0, 0], 0.1 * R, 0.5 * R, n_max=n_max)
-    assert np.linalg.norm(force[0, 0] - expected0) / np.linalg.norm(expected0) < 1e-8
+    assert np.linalg.norm(force[0, 0] - expected0) / np.linalg.norm(expected0) < 1e-10
 
 
 def test_image_force_cross_coupling_matches_exact_flat_plane_multi_image():
@@ -283,3 +292,37 @@ def test_image_force_cross_coupling_matches_exact_hemisphere_tip_multi_image():
 
     F0_alone = sol.image_force(positions[:1], charges[:1], active[:1], d_lo, d_hi, n_max=n_max)[0]
     assert np.linalg.norm(F_bem[0] - F0_alone) > 0.1 * np.linalg.norm(F_exact[0])
+
+
+def test_image_force_gpu_matches_cpu():
+    """image_force's whole pipeline (closest-point search, mirror-charge
+    RHS, per-mode solve, joint field reconstruction, all-pairs mirror
+    cross-term) run with xp=cupy must reproduce the xp=numpy answer to
+    near machine precision -- every array op in the method was rewritten
+    to go through `xp` for this (previously it forced everything to numpy
+    internally, see git history), so this is the end-to-end check that the
+    rewrite didn't silently drop back to numpy semantics or mix array
+    modules somewhere."""
+    cp = pytest.importorskip("cupy")
+    from specific_particle_tracer.bem.mesh import hemisphere_tip_image_profile
+
+    R = 50e-9
+    z0 = 3e-9
+    profile = hemisphere_tip_image_profile(R, z0, 5 * R, n_theta=20, n_fillet=8, n_r=10)
+    n_max = 8
+    sol = ImageChargeBEMSolution.solve(profile, n_max=n_max)
+
+    theta1, theta2 = np.radians(15.0), np.radians(35.0)
+    p1 = 1.1 * R * np.array([np.sin(theta1), 0.0, np.cos(theta1)])
+    p2 = 1.2 * R * np.array([0.0, np.sin(theta2), np.cos(theta2)])
+    positions = np.stack([p1, p2])
+    charges = np.array([-1.0, -1.3])
+    active = np.array([True, True])
+    d_lo, d_hi = 0.1 * R, 0.5 * R
+
+    F_cpu = sol.image_force(positions, charges, active, d_lo, d_hi, n_max=n_max, xp=np)
+    F_gpu = sol.image_force(
+        cp.asarray(positions), cp.asarray(charges), cp.asarray(active), d_lo, d_hi, n_max=n_max, xp=cp
+    )
+
+    assert np.max(np.abs(cp.asnumpy(F_gpu) - F_cpu) / np.abs(F_cpu)) < 1e-8

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from scipy import integrate
 
 from specific_particle_tracer.bem.mesh import sphere_cap_profile
@@ -6,6 +7,8 @@ from specific_particle_tracer.bem.axisymmetric import (
     ring_potential,
     ring_field,
     AxisymmetricBEMSolution,
+    _closest_point_on_profile,
+    _segment_endpoints,
 )
 from specific_particle_tracer.fields import HemisphericalTipField
 from specific_particle_tracer.bem.fields import HemisphericalTipBEMField
@@ -182,3 +185,36 @@ def test_hemispherical_tip_bem_field_is_zero_inside_the_conductor():
 
     E = bem_field.evaluate(np.concatenate([inside_tip, below_plane], axis=0))
     assert np.all(E == 0.0)
+
+
+def test_closest_point_on_profile_gpu_kernel_matches_cpu():
+    """The RawKernel path (dispatched automatically whenever xp is cupy)
+    must reproduce the plain-Python-loop CPU path exactly. Worth checking
+    independently, not just trusting a passing numpy test: a RawKernel
+    reads its arguments as flat pointers with no stride information, so
+    passing a non-contiguous array view (e.g. one column of a (n, 2)
+    C-order array, which is a stride-2 view, not a contiguous buffer) reads
+    silently-wrong-but-finite data with no exception at all -- caught here
+    once already (segment/t/normal disagreed while dist2 coincidentally
+    matched for a subset of points) before the columns passed to the
+    kernel were made explicitly contiguous."""
+    cp = pytest.importorskip("cupy")
+
+    R = 50e-9
+    profile = sphere_cap_profile(R, n_theta=30)
+    p0, p1, tangent, normal = _segment_endpoints(profile)
+
+    rng = np.random.default_rng(0)
+    N = 200
+    rho = rng.uniform(0, R, N)
+    z = rng.uniform(-0.2 * R, 1.2 * R, N)
+
+    bd2_cpu, bseg_cpu, bt_cpu, bn_cpu = _closest_point_on_profile(rho, z, p0, p1, tangent, normal, np)
+    bd2_gpu, bseg_gpu, bt_gpu, bn_gpu = _closest_point_on_profile(
+        cp.asarray(rho), cp.asarray(z), p0, p1, tangent, normal, cp
+    )
+
+    assert np.allclose(cp.asnumpy(bd2_gpu), bd2_cpu, atol=1e-12, rtol=1e-10)
+    assert np.array_equal(cp.asnumpy(bseg_gpu), bseg_cpu)
+    assert np.allclose(cp.asnumpy(bt_gpu), bt_cpu, atol=1e-12)
+    assert np.allclose(cp.asnumpy(bn_gpu), bn_cpu, atol=1e-12)

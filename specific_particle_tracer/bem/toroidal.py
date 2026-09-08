@@ -115,53 +115,116 @@ limited by the finite-difference step, not the identity). This lets
 `toroidal_Q` return the derivative for free from the same recursion pass,
 needed by bem.ring_modes for the field (not just potential) kernels.
 
-An FFT-based alternative was tested and rejected for this use
---------------------------------------------------------------
-Since Q_{m-1/2}(chi) = (1/sqrt(2)) * integral_0^pi cos(m*phi)/sqrt(chi -
-cos(phi)) dphi, all modes can be pulled at once as the (real) Fourier
-coefficients of f(phi) = 1/sqrt(chi - cos(phi)) sampled on a uniform grid
-and run through `xp.fft.rfft` -- attractive on GPU (no sequential
-recursion, one highly-optimized batched call). Tested directly against
-mpmath over the same (chi, n_max) combinations used by the ratio
-recursion above: the FFT approach's error does *not* keep shrinking with
-more sample points past a wall around 1e-4 to 1e-2 relative error for
-modes whose magnitude has decayed a few orders below the m=0 term --
-extracting an exponentially-small Fourier coefficient from a sum of
-O(1)-magnitude samples is its own form of catastrophic cancellation, one
-extra sample points can't fix. The ratio recursion above has no such
-wall (checked against the identical (chi, n_max) grid: machine precision
-throughout, including at modes where the FFT approach had already
-plateaued). Good enough for the fixed (non-adaptive) field-evaluation
-quadrature, where the modes needed are known to matter (see
-bem.image_charge's measured mode counts) and don't reach that floor --
-not accurate enough for the operator *assembly* step's adaptive
-self-term quadrature, which needs every mode kept to full precision
-regardless of how small. Since assembly cost is dominated by the Python-
-level adaptive-quadrature recursion structure rather than by
-`toroidal_Q` itself (checked directly: assembling with n_max=2 and
-n_max=40 took the same wall-clock time), FFT would not even speed up the
-current bottleneck -- revisit if/when GPU field-*evaluation* throughput
-(not assembly) becomes the limiting cost, since it's dramatically faster
-there when its accuracy suffices (same benchmark as the table above, chi
-in [1.05, 5], n_max=20 -- note bem.image_charge's own field-evaluation
-path doesn't run on GPU today regardless, so this is a future-facing
-number, not a currently-realized speedup):
-
-    N        CPU ratio   CPU FFT    GPU ratio   GPU FFT
-    1          0.19 ms   0.02 ms      4.6 ms    0.22 ms
-    100        0.30 ms   0.14 ms      8.1 ms    0.29 ms
-    10000      4.89 ms  22.38 ms      8.3 ms    0.46 ms
-    1e6           --        --       12.6 ms   45.48 ms
-
-FFT wins by 20-30x on GPU for small-to-medium batches (no sequential
-Python loop at all, one batched rfft call), but loses to the ratio
-recursion again by N~1e6 (more total work per element: Nphi=256 samples
-vs. a handful of recursion steps) and on CPU past a few thousand elements.
+An FFT-based alternative (pulling all modes at once as Fourier
+coefficients of 1/sqrt(chi-cos(phi)) via `xp.fft.rfft`) was tried and
+dropped: its error hits a floor around 1e-4 to 1e-2 relative for modes
+that have decayed a few orders below the dominant one (extracting an
+exponentially-small Fourier coefficient from O(1)-magnitude samples is
+its own form of catastrophic cancellation, more sample points don't fix
+it) -- not accurate enough for the operator assembly step, which needs
+every mode kept to full precision regardless of size.
 """
 
 import numpy as np
 
 from ._elliptic import ellip_ke
+
+# Upper bound on M (= max(n_max, 1)) the RawKernel path below will handle;
+# above this it falls back to the plain Python-loop recursion (works on
+# any xp, just with the per-iteration kernel-launch overhead the RawKernel
+# exists to avoid -- see _toroidal_ratio_cumprod_gpu's docstring). 64 is
+# generous: this project's own image-charge mode counts top out in the
+# 10s (see bem.image_charge's measured mode-count-vs-standoff table).
+_TOROIDAL_MAX_KERNEL_M = 64
+
+_TOROIDAL_RATIO_KERNEL_SOURCE = r"""
+extern "C" __global__
+void toroidal_ratio_cumprod(const double* chi, double* u, int M, int N, long long n_elements) {
+    long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= n_elements) return;
+
+    double c = chi[idx];
+    double r_next = 0.0;
+    double r[65];  // r[1..M], M <= 64 enforced by the Python wrapper
+
+    for (int n = N; n >= 1; n--) {
+        double rn = (n - 0.5) / (2.0 * n * c - (n + 0.5) * r_next);
+        if (n <= M) {
+            r[n] = rn;
+        }
+        r_next = rn;
+    }
+
+    double cumprod = 1.0;
+    for (int n = 1; n <= M; n++) {
+        cumprod *= r[n];
+        u[(long long)(n - 1) * n_elements + idx] = cumprod;
+    }
+}
+"""
+
+_toroidal_ratio_kernel = None
+
+
+def _get_toroidal_ratio_kernel():
+    global _toroidal_ratio_kernel
+    if _toroidal_ratio_kernel is None:
+        import cupy as cp
+
+        _toroidal_ratio_kernel = cp.RawKernel(_TOROIDAL_RATIO_KERNEL_SOURCE, "toroidal_ratio_cumprod")
+    return _toroidal_ratio_kernel
+
+
+def _toroidal_ratio_cumprod_loop(chi, M, N, xp):
+    """u[n] = r_1*r_2*...*r_n for n=0..M (u[0]=1), via the plain Python
+    downward-then-upward loop (see module docstring) -- works on any xp,
+    but each of the up-to-N downward iterations launches a handful of tiny
+    elementwise kernels when xp is cupy, which `_toroidal_ratio_cumprod_gpu`
+    exists to avoid by fusing the whole per-element recursion into one
+    kernel launch instead."""
+    r_next = xp.zeros(chi.shape)
+    r = xp.ones((M + 1,) + chi.shape)
+    for n in range(N, 0, -1):
+        r_n = (n - 0.5) / (2.0 * n * chi - (n + 0.5) * r_next)
+        if n <= M:
+            r[n] = r_n
+        r_next = r_n
+
+    u = xp.empty((M + 1,) + chi.shape)
+    u[0] = 1.0
+    for n in range(1, M + 1):
+        u[n] = u[n - 1] * r[n]
+    return u
+
+
+def _toroidal_ratio_cumprod_gpu(chi, M, N):
+    """Same as `_toroidal_ratio_cumprod_loop` (u[n] = r_1*...*r_n, u[0]=1),
+    but as a single cupy.RawKernel launch: one CUDA thread per chi element,
+    looping over its own N-step recursion (and the M-step cumulative
+    product) entirely in device code. `_toroidal_ratio_cumprod_loop`'s
+    Python loop instead launches ~N tiny elementwise kernels (one set of
+    multiply/subtract/divide ops per downward step, over the *whole* chi
+    array each time) -- fine for a handful of iterations, but N can reach
+    the low thousands for near-coincident chi (see module docstring), and
+    each launch carries fixed overhead regardless of how much work it
+    does. Measured (chi in [1.05, 5], n_max=20, RTX 5070 Ti): the
+    kernel-launch overhead this removes dominates `toroidal_Q`'s GPU cost
+    at small-to-medium batch sizes -- see bem.image_charge's own
+    CPU-vs-GPU image_force timing, which is what motivated writing this."""
+    import cupy as cp
+
+    chi_flat = cp.ascontiguousarray(chi.reshape(-1))
+    n_elements = chi_flat.size
+    out = cp.empty((M, n_elements), dtype=cp.float64)  # out[n-1] = u[n], n=1..M
+    if n_elements > 0:
+        threads = 256
+        blocks = (n_elements + threads - 1) // threads
+        kernel = _get_toroidal_ratio_kernel()
+        kernel((blocks,), (threads,), (chi_flat, out, np.int32(M), np.int32(N), np.int64(n_elements)))
+    u = cp.empty((M + 1, n_elements), dtype=cp.float64)
+    u[0] = 1.0
+    u[1:] = out
+    return u.reshape((M + 1,) + chi.shape)
 
 
 def toroidal_Q(chi, n_max, xp=np, pad_min=50, pad_const=40.0):
@@ -210,22 +273,16 @@ def toroidal_Q(chi, n_max, xp=np, pad_min=50, pad_const=40.0):
     K, _ = ellip_ke(2.0 / (chi + 1.0), xp)  # E discarded: not needed (see module docstring)
     q0 = xp.sqrt(2.0 / (chi + 1.0)) * K
 
-    # Downward continued-fraction recursion for r_n = Q_{n-1/2}/Q_{n-3/2}
-    # (see module docstring) -- bounded throughout, no seed or rescaling
-    # needed, no data-dependent branching.
-    r_next = xp.zeros(chi.shape)
-    r = xp.ones((M + 1,) + chi.shape)
-    for n in range(N, 0, -1):
-        r_n = (n - 0.5) / (2.0 * n * chi - (n + 0.5) * r_next)
-        if n <= M:
-            r[n] = r_n
-        r_next = r_n
+    # u[n] = r_1*r_2*...*r_n (the downward continued-fraction recursion's
+    # cumulative product, see module docstring); q_all = q0*u. On GPU with
+    # a modest mode count, the fused RawKernel avoids the Python loop's
+    # per-iteration launch overhead -- see _toroidal_ratio_cumprod_gpu.
+    if xp is not np and M <= _TOROIDAL_MAX_KERNEL_M:
+        u = _toroidal_ratio_cumprod_gpu(chi, M, N)
+    else:
+        u = _toroidal_ratio_cumprod_loop(chi, M, N, xp)
 
-    q_all = xp.empty((M + 1,) + chi.shape)
-    q_all[0] = q0
-    for n in range(1, M + 1):
-        q_all[n] = q_all[n - 1] * r[n]
-
+    q_all = q0[None, ...] * u
     q = q_all[: n_max + 1]
     q1 = q_all[1]  # Q_{1/2}, always available regardless of n_max (see M above)
 

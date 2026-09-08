@@ -176,6 +176,70 @@ tests the cross-mirror-charge sum) it matches `forces.image_charge_force`
 to machine precision; on the real hemisphere-tip geometry it matches
 `forces.hemispherical_tip_image_force`'s all-pairs 3-image solution to
 the same few-percent level the single-particle case already did.
+
+GPU support
+-----------
+`image_force` (not `image_field`, kept CPU/numpy-only as a simpler
+validated reference) runs its whole per-call pipeline -- closest-point
+search, mirror-charge reflection, RHS assembly, the per-mode linear solve,
+joint field reconstruction, the all-pairs mirror cross-term -- on whatever
+`xp` is passed (the one-time operator *assembly*, `ImageChargeBEMSolution.
+solve`, stays numpy/CPU-only regardless, like the rest of this project's
+BEM solves; see bem.geometry.HemisphericalTipBEMGeometry's docstring).
+Field reconstruction was also rewritten to use a single fixed, precomputed
+quadrature (`_segment_quadrature_geometry`/`_interp_nodal_density`) instead
+of a Python loop over profile segments -- both faster on CPU and, more
+importantly, GPU-friendly (one batch of array ops instead of one round of
+kernel launches per segment).
+
+Two remaining Python-level loops turned out to dominate GPU cost even
+after that, at the small-to-medium particle counts most simulations
+actually use, and got custom `cupy.RawKernel`s:
+
+- `bem.toroidal.toroidal_Q`'s downward recursion (see that module) --
+  every mode-kernel call (`point_charge_potential_modes` for the RHS,
+  `ring_field_modes` for field reconstruction) goes through it, and its
+  loop length is set by chi (how close field and source points are), not
+  by batch size, so it doesn't amortize away for a big batch of particles
+  the way ordinary vectorized work does.
+- `bem.axisymmetric._closest_point_on_profile` (shared with that module's
+  own near-surface field regularization) -- its loop length is the number
+  of profile segments (tens), and even without any data-dependent
+  branching, tens of Python-level iterations each launching several tiny
+  elementwise kernels (clip, compare, three `xp.where`s) turned out to
+  dominate GPU cost at query-point counts as small as 10.
+
+Both fuse their whole per-element loop into one kernel launch (one CUDA
+thread per chi / per query point, looping internally in device code) and
+fall back to the original per-xp Python loop when the fast path doesn't
+apply (numpy always; cupy above `toroidal._TOROIDAL_MAX_KERNEL_M`, a mode
+count the per-thread local array size needs bounding, which the profile
+closest-point kernel doesn't need since it just reads global memory).
+Measured impact on `image_force` itself (this project's actual hemisphere-
+tip geometry, n_max=12, RTX 5070 Ti, before -> after both kernels):
+
+    N        CPU          GPU before    GPU after    speedup before/after
+    1        4.2 ms        68.2 ms        8.4 ms      0.06x  ->  0.50x
+    10       6.9 ms        66.7 ms        8.5 ms      0.10x  ->  0.81x
+    100     56.1 ms        76.8 ms        9.7 ms      0.72x  ->  5.81x
+    1000  1267.0 ms        86.6 ms       32.0 ms     15.65x  -> 39.62x
+
+The GPU/CPU crossover point (where GPU stops being a net loss) moved from
+somewhere around N~300-1000 down to N~10-20 -- worth knowing before
+assuming "GPU" automatically means "fast" for a small particle batch.
+
+A RawKernel argument gotcha worth remembering if this code is touched
+again: it receives array arguments as flat pointers with *no stride
+information*. Passing a non-contiguous view (e.g. one column of a
+(n, 2) C-order array, a stride-2 view) reads silently-wrong-but-finite
+data with no exception at all -- caught exactly this way while writing
+the closest-point kernel (segment index, t, and normal disagreed with the
+CPU reference on some points while the reported distance coincidentally
+still matched, because the kernel was reading interleaved rho/z-like
+garbage instead of the intended column). Every array handed to
+`kernel(...)` must be made contiguous explicitly first
+(`cp.ascontiguousarray`), even if it was already a "real" array a moment
+before slicing.
 """
 
 import numpy as np
@@ -185,16 +249,29 @@ from .axisymmetric import _GAUSS_X, _GAUSS_W, _segment_endpoints, _closest_point
 from .ring_modes import ring_potential_modes, ring_field_modes, point_charge_potential_modes
 
 
-def _smoothstep(t):
-    t = np.clip(t, 0.0, 1.0)
+def _to_xp(arr, xp, dtype=None):
+    """Move arr onto array module xp, safely: numpy can't implicitly
+    convert a cupy array (it raises rather than silently round-tripping
+    through the host), so route through `backend.to_numpy` first whenever
+    the target is numpy; going the other way, `xp.asarray` handles both a
+    numpy-array input (host->device copy) and an already-on-xp input (no-op)."""
+    if xp is np:
+        from ..backend import to_numpy
+
+        arr = to_numpy(arr)
+    return xp.asarray(arr, dtype=dtype) if dtype is not None else xp.asarray(arr)
+
+
+def _smoothstep(t, xp=np):
+    t = xp.clip(t, 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
 
 
-def image_charge_weight(d, d_lo, d_hi):
+def image_charge_weight(d, d_lo, d_hi, xp=np):
     """1 at d <= d_lo, 0 at d >= d_hi, cubic smoothstep in between."""
     if d_hi <= d_lo:
         raise ValueError(f"d_hi must be > d_lo (got d_lo={d_lo!r}, d_hi={d_hi!r})")
-    return _smoothstep((d_hi - d) / (d_hi - d_lo))
+    return _smoothstep((d_hi - d) / (d_hi - d_lo), xp=xp)
 
 
 def mirror_point(p_rho, p_z, closest, tangent_unit, normal_unit):
@@ -216,18 +293,18 @@ def mirror_point(p_rho, p_z, closest, tangent_unit, normal_unit):
     return rho_img, z_img, 1
 
 
-def mirror_points_batch(p_rho, p_z, closest, tangent_unit, normal_unit):
+def mirror_points_batch(p_rho, p_z, closest, tangent_unit, normal_unit, xp=np):
     """Vectorized `mirror_point`: p_rho, p_z shape (N,); closest,
     tangent_unit, normal_unit shape (N, 2) (one closest-point/tangent/
     normal per particle, e.g. from `_closest_points_batch`). Returns
     (rho_img, z_img, side), each shape (N,)."""
-    delta = np.stack([p_rho, p_z], axis=-1) - closest  # (N, 2)
-    d_t = np.sum(delta * tangent_unit, axis=-1)
-    d_n = np.sum(delta * normal_unit, axis=-1)
+    delta = xp.stack([p_rho, p_z], axis=-1) - closest  # (N, 2)
+    d_t = xp.sum(delta * tangent_unit, axis=-1)
+    d_n = xp.sum(delta * normal_unit, axis=-1)
     image = closest + d_t[:, None] * tangent_unit - d_n[:, None] * normal_unit
     rho_img, z_img = image[:, 0], image[:, 1]
-    side = np.where(rho_img < 0.0, -1.0, 1.0)
-    rho_img = np.abs(rho_img)
+    side = xp.where(rho_img < 0.0, -1.0, 1.0)
+    rho_img = xp.abs(rho_img)
     return rho_img, z_img, side
 
 
@@ -262,6 +339,58 @@ def _segment_potential_modes(rho_f, z_f, p0, p1, s0, s1, n_max, refine_ratio, ma
         Phi = ring_potential_modes(rho_f, z_f, rho_s, z_s, n_max)
         total += sigma_s * Phi * seg_len
     return total
+
+
+def _segment_quadrature_geometry(profile, n_subdiv):
+    """Flat, fixed (non-adaptive) per-segment Gauss quadrature nodes over
+    the whole profile -- same sub-panel/Gauss-4 scheme as
+    `bem.axisymmetric._fixed_quadrature`, but *without* baking in a
+    specific nodal density: the density here (sigma_C/sigma_S) is solved
+    fresh per `image_force` call (unlike the one-time axisymmetric solve's
+    fixed sigma), so each quadrature point instead records which segment
+    it's in and its local interpolation parameter t, letting any (n_max+1,
+    n_profile) density array be interpolated onto these nodes with a single
+    vectorized gather-and-blend (`_interp_nodal_density`) -- no Python loop
+    over segments at call time, which is what makes
+    `_field_from_joint_mode_density_batch` a single broadcast instead of
+    the O(n_segments) Python loop earlier versions of this module used.
+
+    Returns
+    -------
+    rho_q, z_q, seg_len_q : arrays, shape (n_quad,)
+    seg_index_q : int array, shape (n_quad,)
+    t_local_q : array, shape (n_quad,)
+    """
+    rho_q, z_q, seg_len_q, seg_index_q, t_local_q = [], [], [], [], []
+    for j in range(len(profile) - 1):
+        p0, p1 = profile[j], profile[j + 1]
+        length = np.linalg.norm(p1 - p0)
+        for k in range(n_subdiv):
+            ta, tb = k / n_subdiv, (k + 1) / n_subdiv
+            for xi, wi in zip(_GAUSS_X, _GAUSS_W):
+                t = ta + 0.5 * (tb - ta) * (xi + 1.0)
+                rho_q.append(p0[0] + t * (p1[0] - p0[0]))
+                z_q.append(p0[1] + t * (p1[1] - p0[1]))
+                seg_len_q.append((length / n_subdiv) * 0.5 * wi)
+                seg_index_q.append(j)
+                t_local_q.append(t)
+    return (
+        np.array(rho_q),
+        np.array(z_q),
+        np.array(seg_len_q),
+        np.array(seg_index_q, dtype=np.int64),
+        np.array(t_local_q),
+    )
+
+
+def _interp_nodal_density(sigma, seg_index, t_local):
+    """sigma: (n_max+1, n_profile), on the same array module as seg_index/
+    t_local. Returns (n_max+1, n_quad): sigma linearly interpolated from
+    profile nodes onto quadrature points, via `_segment_quadrature_geometry`'s
+    (seg_index, t_local) -- a single vectorized gather, not a Python loop."""
+    s0 = sigma[:, seg_index]
+    s1 = sigma[:, seg_index + 1]
+    return s0 + t_local[None, :] * (s1 - s0)
 
 
 def assemble_mode_operators(profile, n_max, refine_ratio=1.0, max_depth=20):
@@ -309,6 +438,7 @@ class ImageChargeBEMSolution:
         self.n_max = n_max
         self._geom = _segment_endpoints(profile)
         self._rho_floor = 1e-6 * max(np.max(profile[:, 0]), 1e-300)
+        self._quad_geom_cache = {}
 
     @classmethod
     def solve(cls, profile, n_max, refine_ratio=1.0, max_depth=20):
@@ -322,19 +452,37 @@ class ImageChargeBEMSolution:
         )
         return closest[0], tangent_unit[0], normal_unit[0], float(dist[0])
 
-    def _closest_points_batch(self, rho, z):
+    def _closest_points_batch(self, rho, z, xp=np):
         """Vectorized closest-point-on-profile search for arrays of (rho, z)
         query points -- shape (N,) in, `(closest, tangent_unit, normal_unit,
-        dist)` out, shapes (N, 2), (N, 2), (N, 2), (N,)."""
-        p0, p1, tangent, normal = self._geom
+        dist)` out, shapes (N, 2), (N, 2), (N, 2), (N,).
+
+        `_closest_point_on_profile` is already xp-generic (it's shared with
+        bem.axisymmetric's own near-surface regularization, already used
+        there with xp=cupy), but it indexes the *profile's* small geometry
+        arrays (p0, p1, tangent, normal -- always built as numpy, since the
+        profile itself is tiny) with an *xp*-array index (`best_seg`) it
+        computes internally; numpy can't be indexed by a cupy array, so
+        those small arrays need converting to xp first when xp is cupy."""
+        p0, p1, tangent, normal = (_to_xp(a, xp) for a in self._geom)
         best_dist2, best_seg, best_t, best_normal = _closest_point_on_profile(
-            rho, z, p0, p1, tangent, normal, np
+            rho, z, p0, p1, tangent, normal, xp
         )
         closest = p0[best_seg] + best_t[:, None] * tangent[best_seg]
-        seg_length = np.linalg.norm(tangent[best_seg], axis=-1, keepdims=True)
+        seg_length = xp.linalg.norm(tangent[best_seg], axis=-1, keepdims=True)
         tangent_unit = tangent[best_seg] / seg_length
-        dist = np.sqrt(best_dist2)
+        dist = xp.sqrt(best_dist2)
         return closest, tangent_unit, best_normal, dist
+
+    def _quadrature_geometry(self, n_subdiv):
+        """Cached (numpy; converted to xp per call by the caller, matching
+        this project's established pattern -- see e.g.
+        AxisymmetricBEMSolution.quadrature -- of not bothering to cache the
+        xp-converted copy of a small array) flat quadrature geometry, see
+        `_segment_quadrature_geometry`."""
+        if n_subdiv not in self._quad_geom_cache:
+            self._quad_geom_cache[n_subdiv] = _segment_quadrature_geometry(self.profile, n_subdiv)
+        return self._quad_geom_cache[n_subdiv]
 
     def image_field(self, position, charge, d_lo, d_hi, n_max=None):
         """The image-charge (induced-field) contribution at `position`
@@ -439,7 +587,7 @@ class ImageChargeBEMSolution:
             E_residual = np.array([0.0, 0.0, E_residual[2]])
         return (E_residual + E_img) / VACUUM_PERMITTIVITY
 
-    def image_force(self, position, charge, active, d_lo, d_hi, n_max=None, xp=np):
+    def image_force(self, position, charge, active, d_lo, d_hi, n_max=None, n_subdiv=4, xp=np):
         """Batched image-charge *force* (matching the calling convention of
         `forces.image_charge_force`/`forces.hemispherical_tip_image_force`,
         for use as a `geometry.Geometry.image_force` implementation), via a
@@ -483,9 +631,18 @@ class ImageChargeBEMSolution:
             Mirror-charge blending distances, shared by every particle.
         n_max : int, optional
             Defaults to this solution's full precomputed mode count.
-        xp : module, optional -- output array module (input arrays may be
-            on this module too; converted to numpy internally, since this
-            module is numpy-only regardless of `xp`).
+        n_subdiv : int, optional
+            Fixed-quadrature resolution for the field-reconstruction step
+            (see `_field_from_joint_mode_density_batch`); doesn't affect
+            the operator assembly (always adaptive, see `solve`).
+        xp : module, optional
+            numpy or cupy. `position`/`charge`/`active` may already be on
+            either module (or plain Python/numpy, which is always safe to
+            hand to either); everything from here on runs on `xp`,
+            including the per-mode linear solve (`xp.linalg.solve`) --
+            unlike `image_field` (kept numpy-only, a validated reference/
+            special case, see module docstring), this is the path meant to
+            actually run on GPU for a simulation with many particles.
 
         Returns
         -------
@@ -507,75 +664,74 @@ class ImageChargeBEMSolution:
         elsewhere) -- not if it's just summed into a force alongside
         everything else, as the tracker does.
         """
-        from ..backend import to_numpy
+        position_xp = _to_xp(position, xp, dtype=float)
+        charge_xp = _to_xp(charge, xp, dtype=float)
+        active_xp = _to_xp(active, xp, dtype=bool)
 
-        position_np = np.asarray(to_numpy(position), dtype=float)
-        charge_np = np.asarray(to_numpy(charge), dtype=float)
-        active_np = np.asarray(to_numpy(active), dtype=bool)
+        shape = position_xp.shape
+        flat_pos = position_xp.reshape(-1, 3)
+        flat_charge = charge_xp.reshape(-1)
+        flat_active = active_xp.reshape(-1)
 
-        shape = position_np.shape
-        flat_pos = position_np.reshape(-1, 3)
-        flat_charge = charge_np.reshape(-1)
-        flat_active = active_np.reshape(-1)
-
-        force = np.zeros_like(flat_pos)
-        idx = np.nonzero(flat_active)[0]
+        force = xp.zeros_like(flat_pos)
+        idx = xp.nonzero(flat_active)[0]
         if idx.size == 0:
-            return force.reshape(shape) if xp is np else xp.asarray(force.reshape(shape))
+            return force.reshape(shape)
 
         n_max = self.n_max if n_max is None else n_max
 
         pos = flat_pos[idx]
         q = flat_charge[idx]
         x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
-        rho = np.hypot(x, y)
-        phi = np.arctan2(y, x)
-        rho_safe = np.maximum(rho, self._rho_floor)
+        rho = xp.hypot(x, y)
+        phi = xp.arctan2(y, x)
+        rho_safe = xp.maximum(rho, self._rho_floor)
 
-        closest, tangent_unit, normal_unit, dist = self._closest_points_batch(rho_safe, z)
+        closest, tangent_unit, normal_unit, dist = self._closest_points_batch(rho_safe, z, xp=xp)
         if d_hi > d_lo:
-            w = image_charge_weight(dist, d_lo, d_hi)
+            w = image_charge_weight(dist, d_lo, d_hi, xp=xp)
         else:
-            w = np.zeros_like(dist)
+            w = xp.zeros_like(dist)
 
-        rho_img, z_img, side = mirror_points_batch(rho_safe, z, closest, tangent_unit, normal_unit)
-        phi_img = np.where(side > 0, phi, phi + np.pi)
+        rho_img, z_img, side = mirror_points_batch(rho_safe, z, closest, tangent_unit, normal_unit, xp=xp)
+        phi_img = xp.where(side > 0, phi, phi + xp.pi)
         q_img = -q * w
 
-        profile_rho = np.maximum(self.profile[:, 0], self._rho_floor)
-        profile_z = self.profile[:, 1]
-        m = np.arange(n_max + 1)
+        profile_rho = _to_xp(np.maximum(self.profile[:, 0], self._rho_floor), xp)
+        profile_z = _to_xp(self.profile[:, 1], xp)
+        m = xp.arange(n_max + 1, dtype=float)
 
         def _rhs_contribution(source_rho, source_z, source_phi, source_charge):
             g = point_charge_potential_modes(
-                profile_rho[None, :], profile_z[None, :], source_rho[:, None], source_z[:, None], n_max
+                profile_rho[None, :], profile_z[None, :], source_rho[:, None], source_z[:, None], n_max, xp=xp
             )  # (n_max+1, N, n_profile)
-            cos_phi = np.cos(m[:, None] * source_phi[None, :])  # (n_max+1, N)
-            sin_phi = np.sin(m[:, None] * source_phi[None, :])
+            cos_phi = xp.cos(m[:, None] * source_phi[None, :])  # (n_max+1, N)
+            sin_phi = xp.sin(m[:, None] * source_phi[None, :])
             weighted = source_charge[None, :, None] * g  # (n_max+1, N, n_profile)
-            g_c = np.sum(weighted * cos_phi[:, :, None], axis=1)  # (n_max+1, n_profile)
-            g_s = np.sum(weighted * sin_phi[:, :, None], axis=1)
+            g_c = xp.sum(weighted * cos_phi[:, :, None], axis=1)  # (n_max+1, n_profile)
+            g_s = xp.sum(weighted * sin_phi[:, :, None], axis=1)
             return g_c, g_s
 
         g_real_c, g_real_s = _rhs_contribution(rho_safe, z, phi, q)
         g_img_c, g_img_s = _rhs_contribution(rho_img, z_img, phi_img, q_img)
 
-        rhs = -np.stack([g_real_c + g_img_c, g_real_s + g_img_s], axis=-1)  # (n_max+1, n_profile, 2)
-        A = self.A[: n_max + 1, : len(self.profile), : len(self.profile)]
-        sigma = np.linalg.solve(A, rhs)  # (n_max+1, n_profile, 2)
+        rhs = -xp.stack([g_real_c + g_img_c, g_real_s + g_img_s], axis=-1)  # (n_max+1, n_profile, 2)
+        A = _to_xp(self.A[: n_max + 1, : len(self.profile), : len(self.profile)], xp)
+        sigma = xp.linalg.solve(A, rhs)  # (n_max+1, n_profile, 2)
         sigma_C, sigma_S = sigma[..., 0], sigma[..., 1]
 
-        E_residual = self._field_from_joint_mode_density_batch(sigma_C, sigma_S, rho_safe, phi, z, n_max)
+        E_residual = self._field_from_joint_mode_density_batch(
+            sigma_C, sigma_S, rho_safe, phi, z, n_max, xp=xp, n_subdiv=n_subdiv
+        )
 
-        query_xyz = _cylindrical_to_cartesian(rho_safe, phi, z)
-        mirror_xyz = _cylindrical_to_cartesian(rho_img, phi_img, z_img)
-        E_mirror = _point_charge_field_batch_all_pairs(query_xyz, mirror_xyz, q_img)
+        query_xyz = _cylindrical_to_cartesian(rho_safe, phi, z, xp=xp)
+        mirror_xyz = _cylindrical_to_cartesian(rho_img, phi_img, z_img, xp=xp)
+        E_mirror = _point_charge_field_batch_all_pairs(query_xyz, mirror_xyz, q_img, xp=xp)
 
         E_total = (E_residual + E_mirror) / VACUUM_PERMITTIVITY
         force[idx] = q[:, None] * E_total
 
-        force = force.reshape(shape)
-        return force if xp is np else xp.asarray(force)
+        return force.reshape(shape)
 
     def _field_from_mode_density(self, sigma_m, rho, phi, z, n_max):
         """Field E = -grad[S[sum_m sigma_m*cos(m*phi')]] at (rho, phi, z),
@@ -613,67 +769,69 @@ class ImageChargeBEMSolution:
         Ey = E_rho * np.sin(phi) + E_phi * np.cos(phi)
         return np.array([Ex, Ey, E_z])
 
-    def _field_from_joint_mode_density_batch(self, sigma_C, sigma_S, rho_q, phi_q, z_q, n_max):
-        """Vectorized generalization of `_field_from_mode_density` to (a)
-        many query points at once (shape (Nq,) arrays) and (b) a *joint*
-        density with both a cos(m*phi') part (sigma_C) and a sin(m*phi')
-        part (sigma_S) -- needed once source particles sit at different,
-        arbitrary azimuths (see `image_force`'s module-docstring-referenced
-        derivation), unlike the single-particle `image_field`'s path, which
-        gets away with a cosine-only series by always rotating the one
-        source to phi'=0 first.
+    def _field_from_joint_mode_density_batch(self, sigma_C, sigma_S, rho_q, phi_q, z_q, n_max, xp=np, n_subdiv=4):
+        """Vectorized generalization of the single-particle field
+        reconstruction to (a) many query points at once (shape (Nq,)
+        arrays) and (b) a *joint* density with both a cos(m*phi') part
+        (sigma_C) and a sin(m*phi') part (sigma_S) -- needed once source
+        particles sit at different, arbitrary azimuths (see `image_force`'s
+        module-docstring-referenced derivation), unlike the single-particle
+        `image_field`'s path, which gets away with a cosine-only series by
+        always rotating the one source to phi'=0 first.
 
-        sigma_C, sigma_S : shape (n_max+1, n_profile).
-        rho_q, phi_q, z_q : shape (Nq,).
+        A single (n_max+1, Nq, n_quad) broadcast over the fixed quadrature
+        from `_quadrature_geometry` -- no Python loop over profile segments
+        (earlier versions of this method had one; see
+        `_segment_quadrature_geometry`'s docstring) -- so this is both
+        faster on CPU and, more importantly, GPU-friendly: one batch of
+        array ops instead of one Python-level (hence one round of kernel
+        launches) iteration per segment.
+
+        sigma_C, sigma_S : shape (n_max+1, n_profile), on xp.
+        rho_q, phi_q, z_q : shape (Nq,), on xp.
 
         Returns
         -------
-        E : array, shape (Nq, 3)
+        E : array (xp), shape (Nq, 3)
         """
-        p0, p1, tangent, normal = self._geom
-        n_seg = len(p0)
-        n_q = rho_q.shape[0]
-        m = np.arange(n_max + 1)
+        rho_quad_np, z_quad_np, seg_len_np, seg_index_np, t_local_np = self._quadrature_geometry(n_subdiv)
+        rho_quad = _to_xp(rho_quad_np, xp)
+        z_quad = _to_xp(z_quad_np, xp)
+        seg_len = _to_xp(seg_len_np, xp)
+        seg_index = _to_xp(seg_index_np, xp)
+        t_local = _to_xp(t_local_np, xp)
 
-        e_rho_c = np.zeros((n_max + 1, n_q))
-        e_rho_s = np.zeros((n_max + 1, n_q))
-        e_z_c = np.zeros((n_max + 1, n_q))
-        e_z_s = np.zeros((n_max + 1, n_q))
-        e_phi_amp_c = np.zeros((n_max + 1, n_q))
-        e_phi_amp_s = np.zeros((n_max + 1, n_q))
+        dens_c = _interp_nodal_density(sigma_C, seg_index, t_local)  # (n_max+1, n_quad)
+        dens_s = _interp_nodal_density(sigma_S, seg_index, t_local)
+        weight_c = dens_c * seg_len[None, :]
+        weight_s = dens_s * seg_len[None, :]
 
-        for j in range(n_seg):
-            for xi, wi in zip(_GAUSS_X, _GAUSS_W):
-                t = 0.5 * (xi + 1.0)
-                rho_s = p0[j, 0] + t * (p1[j, 0] - p0[j, 0])
-                z_s = p0[j, 1] + t * (p1[j, 1] - p0[j, 1])
-                seg_len = np.linalg.norm(tangent[j]) * 0.5 * wi
+        # (n_max+1, Nq, n_quad): every query point against every quadrature
+        # node at once.
+        Phi, dPhi_drho, dPhi_dz = ring_field_modes(
+            rho_q[:, None], z_q[:, None], rho_quad[None, :], z_quad[None, :], n_max, xp=xp
+        )
 
-                dens_c = sigma_C[:, j] + t * (sigma_C[:, j + 1] - sigma_C[:, j])  # (n_max+1,)
-                dens_s = sigma_S[:, j] + t * (sigma_S[:, j + 1] - sigma_S[:, j])
+        e_rho_c = xp.sum(-weight_c[:, None, :] * dPhi_drho, axis=-1)  # (n_max+1, Nq)
+        e_rho_s = xp.sum(-weight_s[:, None, :] * dPhi_drho, axis=-1)
+        e_z_c = xp.sum(-weight_c[:, None, :] * dPhi_dz, axis=-1)
+        e_z_s = xp.sum(-weight_s[:, None, :] * dPhi_dz, axis=-1)
 
-                Phi, dPhi_drho, dPhi_dz = ring_field_modes(rho_q, z_q, rho_s, z_s, n_max)  # (n_max+1, Nq)
+        m = xp.arange(n_max + 1, dtype=float)
+        m_over_rho = m[:, None, None] / rho_q[None, :, None]  # (n_max+1, Nq, 1)
+        e_phi_amp_c = xp.sum(weight_c[:, None, :] * Phi * m_over_rho, axis=-1)
+        e_phi_amp_s = xp.sum(weight_s[:, None, :] * Phi * m_over_rho, axis=-1)
 
-                w_c = (dens_c * seg_len)[:, None]
-                w_s = (dens_s * seg_len)[:, None]
-                e_rho_c += -w_c * dPhi_drho
-                e_rho_s += -w_s * dPhi_drho
-                e_z_c += -w_c * dPhi_dz
-                e_z_s += -w_s * dPhi_dz
-                m_over_rho = (m[:, None] / rho_q[None, :])
-                e_phi_amp_c += w_c * Phi * m_over_rho
-                e_phi_amp_s += w_s * Phi * m_over_rho
+        cos_m_phi = xp.cos(m[:, None] * phi_q[None, :])  # (n_max+1, Nq)
+        sin_m_phi = xp.sin(m[:, None] * phi_q[None, :])
 
-        cos_m_phi = np.cos(m[:, None] * phi_q[None, :])  # (n_max+1, Nq)
-        sin_m_phi = np.sin(m[:, None] * phi_q[None, :])
+        E_rho = xp.sum(e_rho_c * cos_m_phi + e_rho_s * sin_m_phi, axis=0)
+        E_z = xp.sum(e_z_c * cos_m_phi + e_z_s * sin_m_phi, axis=0)
+        E_phi = xp.sum(e_phi_amp_c * sin_m_phi - e_phi_amp_s * cos_m_phi, axis=0)
 
-        E_rho = np.sum(e_rho_c * cos_m_phi + e_rho_s * sin_m_phi, axis=0)
-        E_z = np.sum(e_z_c * cos_m_phi + e_z_s * sin_m_phi, axis=0)
-        E_phi = np.sum(e_phi_amp_c * sin_m_phi - e_phi_amp_s * cos_m_phi, axis=0)
-
-        Ex = E_rho * np.cos(phi_q) - E_phi * np.sin(phi_q)
-        Ey = E_rho * np.sin(phi_q) + E_phi * np.cos(phi_q)
-        return np.stack([Ex, Ey, E_z], axis=-1)
+        Ex = E_rho * xp.cos(phi_q) - E_phi * xp.sin(phi_q)
+        Ey = E_rho * xp.sin(phi_q) + E_phi * xp.cos(phi_q)
+        return xp.stack([Ex, Ey, E_z], axis=-1)
 
 
 def _point_charge_field(rho, phi, z, rho0, phi0, z0, charge):
@@ -690,11 +848,11 @@ def _point_charge_field(rho, phi, z, rho0, phi0, z0, charge):
     return charge * d / (4.0 * np.pi * r**3)
 
 
-def _cylindrical_to_cartesian(rho, phi, z):
-    return np.stack([rho * np.cos(phi), rho * np.sin(phi), z], axis=-1)
+def _cylindrical_to_cartesian(rho, phi, z, xp=np):
+    return xp.stack([rho * xp.cos(phi), rho * xp.sin(phi), z], axis=-1)
 
 
-def _point_charge_field_batch_all_pairs(query_xyz, source_xyz, source_charge):
+def _point_charge_field_batch_all_pairs(query_xyz, source_xyz, source_charge, xp=np):
     """Ordinary Coulomb field (G = 1/(4*pi*r)) at each of N query points due
     to the sum of M point charges -- the all-pairs (N, M) cross term needed
     when adding every particle's own local mirror charge back (see
@@ -713,7 +871,7 @@ def _point_charge_field_batch_all_pairs(query_xyz, source_xyz, source_charge):
     E : array, shape (N, 3)
     """
     diff = query_xyz[:, None, :] - source_xyz[None, :, :]  # (N, M, 3)
-    r = np.linalg.norm(diff, axis=-1)  # (N, M)
-    r_safe = np.where(r > 0.0, r, 1.0)
-    coeff = np.where(r > 0.0, source_charge[None, :] / (4.0 * np.pi * r_safe**3), 0.0)
-    return np.einsum("nm,nmc->nc", coeff, diff)
+    r = xp.linalg.norm(diff, axis=-1)  # (N, M)
+    r_safe = xp.where(r > 0.0, r, 1.0)
+    coeff = xp.where(r > 0.0, source_charge[None, :] / (4.0 * xp.pi * r_safe**3), 0.0)
+    return xp.einsum("nm,nmc->nc", coeff, diff)
