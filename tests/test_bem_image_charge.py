@@ -176,7 +176,17 @@ def test_real_hemisphere_tip_matches_exact_three_image_analytic_solution():
 def test_image_force_batch_matches_single_particle_image_field():
     """image_force (batched, matching geometry.Geometry's calling
     convention) must agree with charge * image_field for each active
-    particle, and leave inactive particles at exactly zero force."""
+    particle, and leave inactive particles at exactly zero force.
+
+    Deliberately off-axis and off the phi=0 symmetry plane: an exactly
+    on-axis (or exactly phi=0) position makes the y (or x/y) component
+    mathematically zero by symmetry, and the two code paths round to
+    *different* floating-point-noise values around that true zero (checked
+    directly: away from these special positions the two paths agree to
+    machine precision; a naive component-wise comparison right at them
+    fails only because it's effectively comparing two near-zero noise
+    floors to each other -- the same "small-scale atol trap" this
+    project's own conventions warn about elsewhere)."""
     from specific_particle_tracer.bem.mesh import hemisphere_tip_image_profile
 
     R = 50e-9
@@ -185,9 +195,13 @@ def test_image_force_batch_matches_single_particle_image_field():
     n_max = 6
     sol = ImageChargeBEMSolution.solve(profile, n_max=n_max)
 
-    positions = np.array(
-        [[[0.0, 0.0, 1.2 * R], [0.3 * R, 0.1 * R, np.sqrt(R**2 - 0.1**2 * R**2) * 1.05]]]
+    theta = np.radians(25.0)
+    phi_particle = 0.6
+    active_position = 1.1 * R * np.array(
+        [np.sin(theta) * np.cos(phi_particle), np.sin(theta) * np.sin(phi_particle), np.cos(theta)]
     )
+    inactive_position = np.array([0.3 * R, 0.1 * R, np.sqrt(R**2 - 0.1**2 * R**2) * 1.05])
+    positions = np.array([[active_position, inactive_position]])
     charges = np.array([[-1.0, -1.0]])
     active = np.array([[True, False]])
 
@@ -197,4 +211,75 @@ def test_image_force_batch_matches_single_particle_image_field():
     assert np.all(force[0, 1] == 0.0)
 
     expected0 = charges[0, 0] * sol.image_field(positions[0, 0], charges[0, 0], 0.1 * R, 0.5 * R, n_max=n_max)
-    assert np.allclose(force[0, 0], expected0)
+    assert np.linalg.norm(force[0, 0] - expected0) / np.linalg.norm(expected0) < 1e-8
+
+
+def test_image_force_cross_coupling_matches_exact_flat_plane_multi_image():
+    """The whole point of the joint solve: with >1 active particle,
+    image_force must include the conductor-mediated cross-term (particle
+    j's presence changing the force on particle i), not just each
+    particle's own self-image. On a flat plane the exact multi-particle
+    answer is `forces.image_charge_force`'s own all-pairs treatment
+    (mirror charges only, no BEM) -- with the mirror-charge trick fully
+    engaged (near-zero residual, as in the single-particle flat-plane
+    tests above) this is close to a pure test of the cross-mirror-charge
+    sum, and should match to near machine precision."""
+    from specific_particle_tracer.forces import image_charge_force
+
+    profile = _graded_flat_profile(r_max=200.0, r_min=0.01, growth=1.2)
+    n_max = 4
+    sol = ImageChargeBEMSolution.solve(profile, n_max=n_max)
+
+    positions = np.array([[0.5, 0.2, 0.4], [-0.3, 0.6, 0.7]])
+    charges = np.array([-1.0, -1.5])
+    active = np.array([True, True])
+
+    F_bem = sol.image_force(positions, charges, active, d_lo=1e6, d_hi=1e6 + 1.0, n_max=n_max)
+    F_exact = image_charge_force(positions[None, :, :], charges[None, :], active[None, :], z0=0.0, plummer_radius=1e-12)[0]
+
+    assert np.max(np.abs(F_bem - F_exact) / np.abs(F_exact)) < 1e-10
+
+    # And the cross term must actually matter: computing particle 0 as if
+    # it were alone must NOT match the joint (or exact) answer -- a single
+    # charge above an infinite flat plane feels a purely normal force, but
+    # particle 1's presence breaks that symmetry.
+    F0_alone = sol.image_force(positions[:1], charges[:1], active[:1], d_lo=1e6, d_hi=1e6 + 1.0, n_max=n_max)[0]
+    assert F0_alone[0] == 0.0 and F0_alone[1] == 0.0
+    assert abs(F_bem[0, 0]) > 0.1 * abs(F_bem[0, 2])
+
+
+def test_image_force_cross_coupling_matches_exact_hemisphere_tip_multi_image():
+    """Same cross-coupling check as the flat-plane version above, but on
+    the project's actual (curved, recessed) hemisphere-tip geometry,
+    against `forces.hemispherical_tip_image_force`'s own all-pairs exact
+    3-image solution -- agreement at the same few-percent level the
+    single-particle case already showed (limited by the recessed
+    profile's rounded fillet vs. that formula's sharp-ridge idealization,
+    not by the joint-solve machinery)."""
+    from specific_particle_tracer.bem.mesh import hemisphere_tip_image_profile
+    from specific_particle_tracer.forces import hemispherical_tip_image_force
+
+    R = 50e-9
+    z0 = 3e-9
+    profile = hemisphere_tip_image_profile(R, z0, 5 * R, n_theta=45, n_fillet=15, n_r=20)
+    n_max = 24
+    sol = ImageChargeBEMSolution.solve(profile, n_max=n_max)
+
+    d_lo, d_hi = 0.1 * R, 0.5 * R
+    theta1, theta2 = np.radians(10.0), np.radians(25.0)
+    p1 = 1.1 * R * np.array([np.sin(theta1), 0.0, np.cos(theta1)])
+    p2 = 1.15 * R * np.array([0.0, np.sin(theta2), np.cos(theta2)])
+    positions = np.stack([p1, p2])
+    charges = np.array([-1.0, -1.0])
+    active = np.array([True, True])
+
+    F_bem = sol.image_force(positions, charges, active, d_lo, d_hi, n_max=n_max)
+    F_exact = hemispherical_tip_image_force(
+        positions[None, :, :], charges[None, :], active[None, :], R - z0, plummer_radius=1e-12
+    )[0]
+
+    rel_err = np.linalg.norm(F_bem - F_exact, axis=-1) / np.linalg.norm(F_exact, axis=-1)
+    assert np.max(rel_err) < 0.02
+
+    F0_alone = sol.image_force(positions[:1], charges[:1], active[:1], d_lo, d_hi, n_max=n_max)[0]
+    assert np.linalg.norm(F_bem[0] - F0_alone) > 0.1 * np.linalg.norm(F_exact[0])
