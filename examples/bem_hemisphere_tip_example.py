@@ -18,9 +18,12 @@ Three parts:
    Fourier-mode BEM solve on the recessed image surface, see
    bem/image_charge.py's module docstring -- against this project's exact
    closed-form 3-image solution for this same hemisphere-on-plane shape
-   (forces.hemispherical_tip_image_force). This shape has that exact
-   solution already, so the BEM path isn't the better choice *here* --
-   this comparison exists to validate the general (image-force-capable)
+   (forces.hemispherical_tip_image_force), first for one particle and
+   then for two at once (exercising the joint multi-particle solve's
+   conductor-mediated cross-coupling, since hemispherical_tip_image_force
+   includes that too via its own all-pairs treatment). This shape has an
+   exact solution already, so the BEM path isn't the better choice *here*
+   -- this comparison exists to validate the general (image-force-capable)
    machinery a genuinely non-spherical tip shape would actually need.
 """
 
@@ -132,13 +135,7 @@ bem_geom_with_image = HemisphericalTipBEMGeometry(
 
 print("\nImage-charge force, BEM vs. exact 3-image analytic (this shape has an")
 print("exact solution already -- this is a validation, not a use case). One")
-print("particle at a time on purpose: bem.image_charge's image_force treats")
-print("each particle's induced response independently (its own self-image")
-print("only), unlike hemispherical_tip_image_force's all-pairs treatment --")
-print("so with >1 particle active at once the two would legitimately differ")
-print("by the (real, but not modeled here yet) particle-particle coupling")
-print("mediated by the conductor -- see bem/image_charge.py's image_force")
-print("docstring.")
+print("particle at a time first:")
 for theta_deg, d_over_R in [(5.0, 0.1), (20.0, 0.1)]:
     theta = np.radians(theta_deg)
     position = (1 + d_over_R) * R * np.array([np.sin(theta), 0.0, np.cos(theta)])
@@ -152,3 +149,22 @@ for theta_deg, d_over_R in [(5.0, 0.1), (20.0, 0.1)]:
 
     rel_err = np.linalg.norm(F_bem - F_exact) / np.linalg.norm(F_exact)
     print(f"  theta={theta_deg:5.1f} deg  d/R={d_over_R:.2f}   |F_bem|={np.linalg.norm(F_bem):.4e} N   rel_err={rel_err:.2%}")
+
+print("\nNow two particles at once: bem.image_charge.image_force solves a")
+print("*joint* problem, including the conductor-mediated cross-term (one")
+print("particle's presence changing the induced-charge force on the other)")
+print("-- not just each particle's own self-image. hemispherical_tip_image_force")
+print("includes that cross-term too (its own all-pairs treatment), so this is")
+print("still an apples-to-apples comparison, just with N=2 this time.")
+theta_pair = np.radians([5.0, 20.0])
+positions_pair = 1.1 * R * np.column_stack([np.sin(theta_pair), np.zeros(2), np.cos(theta_pair)])
+charges_pair = np.full(2, -ELEMENTARY_CHARGE)
+active_pair = np.ones(2, dtype=bool)
+
+F_bem_pair = bem_geom_with_image.image_force(positions_pair, charges_pair, active_pair, plummer_radius=1e-12)
+F_exact_pair = hemispherical_tip_image_force(
+    positions_pair[None, :, :], charges_pair[None, :], active_pair[None, :], R - DEFAULT_Z0, plummer_radius=1e-12
+)[0]
+for i in range(2):
+    rel_err = np.linalg.norm(F_bem_pair[i] - F_exact_pair[i]) / np.linalg.norm(F_exact_pair[i])
+    print(f"  particle {i}: |F_bem|={np.linalg.norm(F_bem_pair[i]):.4e} N   rel_err={rel_err:.2%}")
