@@ -290,7 +290,10 @@ def make_accel_fn(charge, particle_mass, charge_to_mass, geometry, plummer_radiu
         c = charge[group_idx]
         m = particle_mass[group_idx]
         accel_field = charge_to_mass * geometry.field(pos)
-        accel_coulomb = coulomb_force(pos, c, active, plummer_radius, xp=xp) / m[..., None]
+        # Independent one-electron groups have no real-real interaction.
+        # Avoid launching the all-pairs kernels merely to obtain zeros.
+        accel_coulomb = (0.0 if pos.shape[1] == 1 else
+            coulomb_force(pos, c, active, plummer_radius, xp=xp) / m[..., None])
         accel_image = geometry.image_force(pos, c, active, plummer_radius) / m[..., None]
         acc = accel_field + accel_coulomb + accel_image
         return xp.where(active[..., None], acc, 0.0)

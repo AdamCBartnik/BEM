@@ -329,7 +329,7 @@ class HemisphericalTipBEMGeometry(geometry_module.Geometry):
         if self._image_solution is None:
             return far
         if self.image_mirror_symmetric:
-            near = self._mirror_symmetric_image_force(position, charge, active, plummer_radius)
+            near = self._mirror_symmetric_image_force(position, charge, active, plummer_radius, _plane_force=far)
         else:
             near = self._image_solution.image_force(
                 position,
@@ -343,7 +343,7 @@ class HemisphericalTipBEMGeometry(geometry_module.Geometry):
         z = position[..., 2]
         return _blend_with_flat_fallback(near, far, z, 0.5 * self.z_handoff, self.z_handoff, xp)
 
-    def _mirror_symmetric_image_force(self, position, charge, active, plummer_radius):
+    def _mirror_symmetric_image_force(self, position, charge, active, plummer_radius, _plane_force=None):
         """`image_force`'s `image_mirror_symmetric=True` path: the image
         solve was built on `bem.mesh.hemisphere_tip_image_doubled_profile`
         -- a closed surface with no plane meshed at all, valid only
@@ -420,9 +420,9 @@ class HemisphericalTipBEMGeometry(geometry_module.Geometry):
         # separation >= 2*z0 always (the softening is just this
         # project's usual safety margin, not load-bearing here).
         # Include every active phantom in the group, not only i's own.
-        direct_phantom = self._flat_fallback.image_force(
-            position, charge, active, plummer_radius
-        )
+        direct_phantom = _plane_force
+        if direct_phantom is None:
+            direct_phantom = self._flat_fallback.image_force(position, charge, active, plummer_radius)
 
         return conductor_mediated + direct_phantom
 

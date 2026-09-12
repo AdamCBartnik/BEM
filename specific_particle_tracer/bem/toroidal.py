@@ -70,18 +70,23 @@ _TOROIDAL_MAX_KERNEL_M = 64
 _TOROIDAL_RATIO_KERNEL_SOURCE = r"""
 extern "C" __global__
 void toroidal_ratio_cumprod(const double* chi, const double* q0,
-    const double* q1, double* out, int M, int pad_min, double pad_const,
+    const double* q1, const double* dq0, double* out, double* deriv,
+    int M, int pad_min, double pad_const,
     long long n_elements) {
     long long idx = (long long)blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= n_elements) return;
     double c = chi[idx], eta = acosh(c);
     out[idx] = q0[idx];
+    deriv[idx] = dq0[idx];
+    double denom = (c-1.0)*(c+1.0);
     if (M * eta <= 1.0) {
         double prev = q0[idx], curr = q1[idx];
         out[n_elements + idx] = curr;
+        deriv[n_elements + idx] = 0.5*(c*curr-prev)/denom;
         for (int n = 1; n < M; n++) {
             double next = (2.0*n*c*curr - (n-0.5)*prev)/(n+0.5);
             out[(long long)(n+1)*n_elements + idx] = next;
+            deriv[(long long)(n+1)*n_elements + idx] = (n+0.5)*(c*next-curr)/denom;
             prev = curr; curr = next;
         }
     } else {
@@ -94,8 +99,10 @@ void toroidal_ratio_cumprod(const double* chi, const double* q0,
         }
         double value = q0[idx];
         for (int n = 1; n <= M; n++) {
+            double prev = value;
             value *= r[n];
             out[(long long)n*n_elements + idx] = value;
+            deriv[(long long)n*n_elements + idx] = (n-0.5)*(c*value-prev)/denom;
         }
     }
 }
@@ -135,19 +142,20 @@ def _toroidal_ratio_cumprod_loop(chi, M, N, xp):
     return u
 
 
-def _hybrid_values(chi, q0, q1, M, xp, pad_min, pad_const):
+def _hybrid_values(chi, q0, q1, dq0, M, xp, pad_min, pad_const):
     if xp is not np and M <= _TOROIDAL_MAX_KERNEL_M:
         import cupy as cp
-        arrays = [cp.ascontiguousarray(a.reshape(-1)) for a in (chi, q0, q1)]
+        arrays = [cp.ascontiguousarray(a.reshape(-1)) for a in (chi, q0, q1, dq0)]
         size = chi.size
         out = cp.empty((M + 1, size), dtype=cp.float64)
+        deriv = cp.empty_like(out)
         if size:
             _get_toroidal_ratio_kernel()(
                 ((size + 255) // 256,), (256,),
-                (*arrays, out, np.int32(M), np.int32(pad_min),
+                (*arrays, out, deriv, np.int32(M), np.int32(pad_min),
                  np.float64(pad_const), np.int64(size)),
             )
-        return out.reshape((M + 1,) + chi.shape)
+        return out.reshape((M + 1,) + chi.shape), deriv.reshape((M + 1,) + chi.shape)
 
     shape = chi.shape
     chi, q0, q1 = (a.reshape(-1) for a in (chi, q0, q1))
@@ -164,7 +172,25 @@ def _hybrid_values(chi, q0, q1, M, xp, pad_min, pad_const):
     if chi[far].size:
         pad = max(pad_min, int(np.ceil(pad_const / float(xp.min(eta[far])))))
         out[:, far] = q0[far][None, :] * _toroidal_ratio_cumprod_loop(chi[far], M, M + pad, xp)
-    return out.reshape((M + 1,) + shape)
+    n = xp.arange(M + 1, dtype=float)[:, None]
+    previous = xp.concatenate([out[1:2], out[:-1]], axis=0)
+    deriv = (n-.5)*(chi[None, :]*out-previous)/((chi-1.)*(chi+1.))[None, :]
+    deriv[0] = dq0.reshape(-1)
+    return out.reshape((M + 1,) + shape), deriv.reshape((M + 1,) + shape)
+
+
+def _elliptic_seeds(chi, xp):
+    p = (chi - 1.0) / (chi + 1.0)
+    K, E = ellip_ke_complement(p, xp)
+    root = xp.sqrt(2.0 / (chi + 1.0))
+    q0 = root * K
+    # Only used near coincidence; large-chi cancellation is avoided by
+    # the downward-ratio branch, which starts from q0 instead.
+    q1 = chi * q0 - xp.sqrt(2.0 * (chi + 1.0)) * E
+    return q0, q1, -root * E / (2.0 * (chi - 1.0))
+
+
+_seeds_fused = None
 
 
 def toroidal_Q(chi, n_max, xp=np, pad_min=50, pad_const=40.0):
@@ -180,17 +206,14 @@ def toroidal_Q(chi, n_max, xp=np, pad_min=50, pad_const=40.0):
         raise ValueError("n_max must be a nonnegative integer")
     chi = xp.maximum(xp.asarray(chi, dtype=float), np.nextafter(1., 2.))
     M = max(n_max, 1)
-    p = (chi - 1.0) / (chi + 1.0)
-    K, E = ellip_ke_complement(p, xp)
-    root = xp.sqrt(2.0 / (chi + 1.0))
-    q0 = root * K
-    # This seed is used only near coincidence; cancellation at large chi
-    # is immaterial because that branch uses Miller ratios instead.
-    q1 = chi * q0 - xp.sqrt(2.0 * (chi + 1.0)) * E
-    q_all = _hybrid_values(chi, q0, q1, M, xp, pad_min, pad_const)
-    q = q_all[:n_max + 1]
-    n = xp.arange(n_max + 1, dtype=float).reshape((-1,) + (1,) * chi.ndim)
-    q_prev = xp.concatenate([q_all[1:2], q[:-1]], axis=0)
-    dq = (n - .5) * (chi[None, ...] * q - q_prev) / ((chi - 1.) * (chi + 1.))[None, ...]
-    dq[0] = -root * E / (2.0 * (chi - 1.0))
-    return q, dq
+    if xp is np:
+        q0, q1, dq0 = _elliptic_seeds(chi, xp)
+    else:
+        global _seeds_fused
+        if _seeds_fused is None:
+            import cupy as cp
+            _seeds_fused = cp.fuse(kernel_name="bem_toroidal_seeds")(
+                lambda chi: _elliptic_seeds(chi, cp))
+        q0, q1, dq0 = _seeds_fused(chi)
+    q, dq = _hybrid_values(chi, q0, q1, dq0, M, xp, pad_min, pad_const)
+    return q[:n_max + 1], dq[:n_max + 1]

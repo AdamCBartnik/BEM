@@ -166,3 +166,15 @@ def test_toroidal_Q_falls_back_to_loop_above_kernel_mode_cap():
     q_cpu, _ = toroidal_Q(chi_cpu, n_max=n_max)
     q_gpu, _ = toroidal_Q(cp.asarray(chi_cpu), n_max=n_max, xp=cp)
     assert np.max(np.abs(cp.asnumpy(q_gpu) - q_cpu)) < 1e-10
+
+
+@pytest.mark.parametrize("n_max", [0, 16, 69])
+def test_gpu_derivatives_across_recurrence_branches(n_max):
+    cp = pytest.importorskip("cupy")
+    chi = np.array([[1.+1e-10, 1.001, 1.1, 3., 10., 100.],
+                    [1.+1e-8, 1.002, 1.2, 4., 20., 200.]])
+    # Noncontiguous input and both recurrence branches in the same call.
+    q, dq = toroidal_Q(cp.asarray(chi).T, n_max, xp=cp)
+    q_cpu, dq_cpu = toroidal_Q(chi.T, n_max)
+    np.testing.assert_allclose(cp.asnumpy(q), q_cpu, rtol=2e-11, atol=1e-30)
+    np.testing.assert_allclose(cp.asnumpy(dq), dq_cpu, rtol=2e-11, atol=1e-30)

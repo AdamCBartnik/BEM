@@ -311,7 +311,9 @@ and how many physical cores vs. how capable a GPU is available.
 import numpy as np
 
 from ..constants import VACUUM_PERMITTIVITY
+from ..backend import array_cache_key
 from .axisymmetric import _GAUSS_X, _GAUSS_W, _segment_endpoints, _closest_point_on_profile
+from .axisymmetric import _prepare_closest_point_gpu
 from .ring_modes import ring_potential_modes, ring_field_modes, point_charge_potential_modes
 
 
@@ -521,6 +523,7 @@ class ImageChargeBEMSolution:
         self._rho_floor = 1e-6 * max(np.max(profile[:, 0]), 1e-300)
         self._quad_geom_cache = {}
         self._A_inv_cache = {}
+        self._device_cache = {}
         # Set by a caller whose `profile` is mirror-doubled (e.g.
         # `bem.geometry.HemisphericalTipBEMGeometry` with
         # `image_mirror_symmetric=True`) to this solution's own mirror
@@ -555,12 +558,19 @@ class ImageChargeBEMSolution:
         step -- paying for a full matrix inverse (roughly 2x the cost of
         one `solve` call) there would be a net loss, not a win.
         """
-        key = (xp.__name__, n_max)
+        key = (array_cache_key(xp), n_max)
         if key not in self._A_inv_cache:
             P = len(self.profile)
             A_sub = _to_xp(self.A[: n_max + 1, :P, :P], xp)
             self._A_inv_cache[key] = xp.linalg.inv(A_sub)
         return self._A_inv_cache[key]
+
+    def _on_backend(self, key, arrays, xp):
+        """Cache only fixed geometry/quadrature, never a source or density."""
+        cache_key = (array_cache_key(xp), key)
+        if cache_key not in self._device_cache:
+            self._device_cache[cache_key] = tuple(_to_xp(a, xp) for a in arrays)
+        return self._device_cache[cache_key]
 
     @classmethod
     def solve(cls, profile, n_max, refine_ratio=1.0, max_depth=20, real_profile=None):
@@ -591,9 +601,15 @@ class ImageChargeBEMSolution:
         geometry; pass `self._real_geom` (as `image_potential`'s masking
         step does) to search against the real surface instead."""
         geom = self._geom if geom is None else geom
-        p0, p1, tangent, normal = (_to_xp(a, xp) for a in geom)
+        p0, p1, tangent, normal = self._on_backend(("geom", id(geom)), geom, xp)
+        prepared = None
+        if xp is not np:
+            key = (array_cache_key(xp), "closest", id(geom))
+            if key not in self._device_cache:
+                self._device_cache[key] = _prepare_closest_point_gpu(p0, tangent, normal)
+            prepared = self._device_cache[key]
         best_dist2, best_seg, best_t, best_normal = _closest_point_on_profile(
-            rho, z, p0, p1, tangent, normal, xp
+            rho, z, p0, p1, tangent, normal, xp, _prepared=prepared
         )
         closest = p0[best_seg] + best_t[:, None] * tangent[best_seg]
         seg_length = xp.linalg.norm(tangent[best_seg], axis=-1, keepdims=True)
@@ -982,8 +998,8 @@ class ImageChargeBEMSolution:
         q_img = -q_eff.reshape(-1) * w
         rho_img, z_img, phi_img, q_img = (a.reshape(G, E) for a in (rho_img, z_img, phi_img, q_img))
 
-        profile_rho = _to_xp(np.maximum(self.profile[:, 0], self._rho_floor), xp)  # (P,)
-        profile_z = _to_xp(self.profile[:, 1], xp)  # (P,)
+        profile_rho, profile_z = self._on_backend("profile", (
+            np.maximum(self.profile[:, 0], self._rho_floor), self.profile[:, 1]), xp)
         P = len(self.profile)
         m = xp.arange(n_max + 1, dtype=float)
 
@@ -1298,11 +1314,8 @@ class ImageChargeBEMSolution:
         E : array (xp), shape (G, E, 3)
         """
         rho_quad_np, z_quad_np, seg_len_np, seg_index_np, t_local_np = self._quadrature_geometry(n_subdiv)
-        rho_quad = _to_xp(rho_quad_np, xp)
-        z_quad = _to_xp(z_quad_np, xp)
-        seg_len = _to_xp(seg_len_np, xp)
-        seg_index = _to_xp(seg_index_np, xp)
-        t_local = _to_xp(t_local_np, xp)
+        rho_quad, z_quad, seg_len, seg_index, t_local = self._on_backend(
+            ("quad", n_subdiv), (rho_quad_np, z_quad_np, seg_len_np, seg_index_np, t_local_np), xp)
 
         dens_c = _interp_nodal_density(sigma_C, seg_index, t_local)  # (n_max+1, G, n_quad)
         dens_s = _interp_nodal_density(sigma_S, seg_index, t_local)
@@ -1315,22 +1328,20 @@ class ImageChargeBEMSolution:
             rho_q[:, :, None], z_q[:, :, None], rho_quad[None, None, :], z_quad[None, None, :], n_max, xp=xp
         )
 
-        e_rho_c = xp.sum(-weight_c[:, :, None, :] * dPhi_drho, axis=-1)  # (n_max+1, G, E)
-        e_rho_s = xp.sum(-weight_s[:, :, None, :] * dPhi_drho, axis=-1)
-        e_z_c = xp.sum(-weight_c[:, :, None, :] * dPhi_dz, axis=-1)
-        e_z_s = xp.sum(-weight_s[:, :, None, :] * dPhi_dz, axis=-1)
-
         m = xp.arange(n_max + 1, dtype=float)
-        m_over_rho = (m[:, None, None] / rho_q[None, :, :])[..., None]  # (n_max+1, G, E, 1)
-        e_phi_amp_c = xp.sum(weight_c[:, :, None, :] * Phi * m_over_rho, axis=-1)
-        e_phi_amp_s = xp.sum(weight_s[:, :, None, :] * Phi * m_over_rho, axis=-1)
-
         cos_m_phi = xp.cos(m[:, None, None] * phi_q[None, :, :])  # (n_max+1, G, E)
         sin_m_phi = xp.sin(m[:, None, None] * phi_q[None, :, :])
-
-        E_rho = xp.sum(e_rho_c * cos_m_phi + e_rho_s * sin_m_phi, axis=0)  # (G, E)
-        E_z = xp.sum(e_z_c * cos_m_phi + e_z_s * sin_m_phi, axis=0)
-        E_phi = xp.sum(e_phi_amp_c * sin_m_phi - e_phi_amp_s * cos_m_phi, axis=0)
+        # Combine cos/sin density before quadrature: three reductions
+        # instead of six. The angular derivative's m/rho factor is constant
+        # across quadrature nodes, so apply it after that reduction.
+        density = (weight_c[:, :, None, :] * cos_m_phi[..., None]
+                   + weight_s[:, :, None, :] * sin_m_phi[..., None])
+        angular_density = (weight_c[:, :, None, :] * sin_m_phi[..., None]
+                           - weight_s[:, :, None, :] * cos_m_phi[..., None])
+        E_rho = xp.sum(xp.sum(-density * dPhi_drho, axis=-1), axis=0)
+        E_z = xp.sum(xp.sum(-density * dPhi_dz, axis=-1), axis=0)
+        E_phi = xp.sum(xp.sum(angular_density * Phi, axis=-1)
+                       * m[:, None, None] / rho_q[None, :, :], axis=0)
 
         Ex = E_rho * xp.cos(phi_q) - E_phi * xp.sin(phi_q)
         Ey = E_rho * xp.sin(phi_q) + E_phi * xp.cos(phi_q)

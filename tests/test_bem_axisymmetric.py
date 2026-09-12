@@ -14,6 +14,24 @@ from specific_particle_tracer.fields import HemisphericalTipField
 from specific_particle_tracer.bem.fields import HemisphericalTipBEMField
 
 
+def test_cached_gpu_field_tracks_changing_points_and_quadrature():
+    cp = pytest.importorskip("cupy")
+    from specific_particle_tracer.bem.axisymmetric import evaluate_axisymmetric_field
+
+    profile = sphere_cap_profile(1., n_theta=15)
+    sigma = 1. + profile[:, 1]
+    solution = AxisymmetricBEMSolution(profile, sigma)
+    points = np.array([[.1, .2, 1.2], [.7, .1, .8], [1.3, .2, .1], [.3, 0., 1.4]])
+    # Reuse the solution with different point counts, strided inputs, and
+    # quadrature orders, as happens when trajectory groups finish.
+    for order, subset in [(4, points), (8, points[::2]), (4, points[1::2])]:
+        device_points = cp.empty((2 * len(subset), 3), dtype=float)[::2]
+        device_points[...] = cp.asarray(subset)
+        actual = cp.asnumpy(solution.field(device_points, n_subdiv=order, xp=cp))
+        expected = evaluate_axisymmetric_field(profile, sigma, subset, n_subdiv=order)
+        np.testing.assert_allclose(actual, expected, rtol=2e-11, atol=2e-13)
+
+
 def test_ring_potential_matches_brute_force_azimuthal_integration():
     """ring_potential(rho, z, a) is meant to be the potential of a
     unit-*total*-charge ring -- check against direct numerical integration

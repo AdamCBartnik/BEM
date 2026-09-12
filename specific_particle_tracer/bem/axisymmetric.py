@@ -87,6 +87,8 @@ approximation. Both quadrature paths are vectorized on NumPy and CuPy.
 
 import numpy as np
 
+from ..backend import array_cache_key
+
 from ._elliptic import ellip_ke as _ellip_ke, ellip_ke_complement
 
 _NEAR_GAUSS_X, _NEAR_GAUSS_W = np.polynomial.legendre.leggauss(8)
@@ -150,7 +152,15 @@ def _get_closest_point_kernel():
     return _closest_point_kernel
 
 
-def _closest_point_on_profile_gpu(rho, z, p0, p1, tangent, normal):
+def _prepare_closest_point_gpu(p0, tangent, normal):
+    import cupy as cp
+    # RawKernel pointers carry no strides. Make the six columns contiguous
+    # once, then keep them on the device for subsequent queries.
+    return tuple(cp.ascontiguousarray(cp.asarray(a, dtype=cp.float64)[:, i])
+                 for a in (p0, tangent, normal) for i in range(2))
+
+
+def _closest_point_on_profile_gpu(rho, z, p0, p1, tangent, normal, _prepared=None):
     """Same contract as `_closest_point_on_profile`, but as a single
     cupy.RawKernel launch: one CUDA thread per query point, looping over
     all n_segments profile segments in device code, instead of the
@@ -167,17 +177,9 @@ def _closest_point_on_profile_gpu(rho, z, p0, p1, tangent, normal):
 
     n_points = rho.shape[0]
     n_seg = len(p0)
-    p0 = cp.asarray(p0, dtype=cp.float64)
-    tangent = cp.asarray(tangent, dtype=cp.float64)
-    normal = cp.asarray(normal, dtype=cp.float64)
-    # Each column of a (n_seg, 2) C-order array is a stride-2 view, not a
-    # contiguous buffer -- a RawKernel argument is just a raw pointer with
-    # no stride information, so an implicitly-strided view here would read
-    # silently-wrong (shuffled) data instead of raising. Every column
-    # passed to the kernel below must be made contiguous explicitly.
-    p0x, p0y = cp.ascontiguousarray(p0[:, 0]), cp.ascontiguousarray(p0[:, 1])
-    abx, aby = cp.ascontiguousarray(tangent[:, 0]), cp.ascontiguousarray(tangent[:, 1])
-    nx, ny = cp.ascontiguousarray(normal[:, 0]), cp.ascontiguousarray(normal[:, 1])
+    p0x, p0y, abx, aby, nx, ny = (
+        _prepare_closest_point_gpu(p0, tangent, normal) if _prepared is None else _prepared
+    )
     rho_c = cp.ascontiguousarray(rho.astype(cp.float64, copy=False))
     z_c = cp.ascontiguousarray(z.astype(cp.float64, copy=False))
 
@@ -227,7 +229,23 @@ def ring_potential(rho, z, a, xp=np):
     return K / (2.0 * xp.pi**2 * xp.sqrt(D))
 
 
+_ring_field_fused = None
+
+
 def ring_field(rho, z, a, xp=np):
+    """Evaluate the same ring field with fused elementwise work on CUDA."""
+    if xp is np:
+        return _ring_field_array(rho, z, a, xp)
+    global _ring_field_fused
+    if _ring_field_fused is None:
+        import cupy as cp
+        _ring_field_fused = cp.fuse(kernel_name="bem_ring_field")(
+            lambda rho, z, a: _ring_field_array(rho, z, a, cp)
+        )
+    return _ring_field_fused(rho, z, a)
+
+
+def _ring_field_array(rho, z, a, xp):
     """Field of a unit-charge ring, with a stable near-ring complement.
 
     The small distance squared is computed directly, not as 1-m after
@@ -320,7 +338,7 @@ def _segment_endpoints(profile):
     return p0, p1, tangent, normal
 
 
-def _closest_point_on_profile(rho, z, p0, p1, tangent, normal, xp):
+def _closest_point_on_profile(rho, z, p0, p1, tangent, normal, xp, _prepared=None):
     """Vectorized closest point on the whole profile to arrays of (rho, z)
     field points: loops over the (few tens of) profile segments, fully
     vectorized over the (possibly many) field points within each
@@ -345,7 +363,7 @@ def _closest_point_on_profile(rho, z, p0, p1, tangent, normal, xp):
     best_normal : array, shape (M, 2)
     """
     if xp is not np:
-        return _closest_point_on_profile_gpu(rho, z, p0, p1, tangent, normal)
+        return _closest_point_on_profile_gpu(rho, z, p0, p1, tangent, normal, _prepared)
 
     M = rho.shape[0]
     best_dist2 = xp.full(M, xp.inf)
@@ -380,12 +398,15 @@ class AxisymmetricBEMSolution:
     every profile node.
 
     Build with `AxisymmetricBEMSolution.solve(profile, dirichlet_fn)`.
+    Treat the profile and solved density as fixed: quadrature and backend
+    arrays are cached. Construct a new solution when either changes.
     """
 
     def __init__(self, profile, sigma):
         self.profile = profile
         self.sigma = sigma
         self._quadrature_cache = {}
+        self._field_cache = {}
 
     @classmethod
     def solve(cls, profile, dirichlet_fn, refine_ratio=1.0, max_depth=20):
@@ -444,7 +465,7 @@ class AxisymmetricBEMSolution:
         """Cached fixed quadrature (see `_fixed_quadrature`) for this
         solution's profile/sigma, as numpy arrays. Field evaluation
         converts these to whatever backend it needs once and caches that
-        too (see `bem.fields.HemisphericalTipBEMField`) -- this method's
+        too (see `field`) -- this method's
         own cache just avoids rebuilding the numpy version repeatedly."""
         if n_subdiv not in self._quadrature_cache:
             self._quadrature_cache[n_subdiv] = _fixed_quadrature(self.profile, self.sigma, n_subdiv)
@@ -459,10 +480,25 @@ class AxisymmetricBEMSolution:
         E : ndarray, same shape as `points`.
         """
         quadrature = self.quadrature(n_subdiv)
-        return evaluate_axisymmetric_field(self.profile, self.sigma, points, quadrature=quadrature, xp=xp)
+        key = (array_cache_key(xp), n_subdiv)
+        if key not in self._field_cache:
+            self._field_cache[key] = _prepare_field_data(self.profile, self.sigma, quadrature, xp)
+        return evaluate_axisymmetric_field(self.profile, self.sigma, points,
+            quadrature=quadrature, xp=xp, _prepared=self._field_cache[key])
 
 
-def evaluate_axisymmetric_field(profile, sigma, points, quadrature=None, n_subdiv=8, xp=np):
+def _prepare_field_data(profile, sigma, quadrature, xp):
+    """Geometry and quadrature are fixed throughout a trajectory."""
+    geom = _segment_endpoints(profile)
+    lengths = xp.asarray(np.linalg.norm(geom[2], axis=-1))
+    p0, tangent = xp.asarray(geom[0]), xp.asarray(geom[2])
+    return dict(geom=geom, lengths=lengths, p0=p0, unit=tangent/lengths[:, None],
+        quadrature=tuple(xp.asarray(a) for a in quadrature), sigma=xp.asarray(sigma),
+        gauss=tuple(xp.asarray(a) for a in (_NEAR_GAUSS_X, _NEAR_GAUSS_W)),
+        closest=None if xp is np else _prepare_closest_point_gpu(geom[0], geom[2], geom[3]))
+
+
+def evaluate_axisymmetric_field(profile, sigma, points, quadrature=None, n_subdiv=8, xp=np, _prepared=None):
     """The field E(x) = -grad[S[sigma]](x) at `points`, for an axisymmetric
     surface-charge density sigma given at the nodes of a generating
     profile -- see module docstring. Fully vectorized: a single
@@ -494,12 +530,11 @@ def evaluate_axisymmetric_field(profile, sigma, points, quadrature=None, n_subdi
     sigma = np.asarray(sigma, dtype=float)
     if quadrature is None:
         quadrature = _fixed_quadrature(profile, sigma, n_subdiv)
-    rho_q, z_q, area_q, sigma_q = (xp.asarray(a) for a in quadrature)
-
-    p0_np, p1_np, tangent_np, normal_np = _segment_endpoints(profile)
-    lengths = xp.asarray(np.linalg.norm(tangent_np, axis=-1))
-    p0, tangent = (xp.asarray(a) for a in (p0_np, tangent_np))
-    unit = tangent / lengths[:, None]
+    data = _prepare_field_data(profile, sigma, quadrature, xp) if _prepared is None else _prepared
+    rho_q, z_q, area_q, sigma_q = data["quadrature"]
+    p0_np, p1_np, tangent_np, normal_np = data["geom"]
+    lengths, p0, unit = data["lengths"], data["p0"], data["unit"]
+    sigma_device = data["sigma"]
     points = xp.asarray(points, dtype=float)
     shape = points.shape
     flat = points.reshape(-1, 3)
@@ -514,7 +549,7 @@ def evaluate_axisymmetric_field(profile, sigma, points, quadrature=None, n_subdi
     # At polygon vertices this specifies a finite one-sided value; the
     # continuum value there is not defined for an arbitrary nodal density.
     dist2, seg, _, normals = _closest_point_on_profile(
-        rho, z, p0_np, p1_np, tangent_np, normal_np, xp
+        rho, z, p0_np, p1_np, tangent_np, normal_np, xp, _prepared=data["closest"]
     )
     offset = xp.where(dist2 < (1e-9*lengths[seg])**2, 1e-4*lengths[seg], 0.0)
     rho_eval = rho + offset * normals[:, 0]
@@ -547,7 +582,7 @@ def evaluate_axisymmetric_field(profile, sigma, points, quadrature=None, n_subdi
         # Gauss-8 per v interval of width at most 0.5.
         count = xp.maximum(1, xp.ceil((hi-lo)/.5).astype(xp.int64))
         n_intervals = int(xp.max(count))
-        gx, gw = _NEAR_GAUSS_X, _NEAR_GAUSS_W
+        gx, gw = data["gauss"]
         v = lo[:, None, None] + (xp.arange(n_intervals)[None, :, None] +
             .5*(xp.asarray(gx)[None, None, :]+1.)) * ((hi-lo)/count)[:, None, None]
         valid = xp.arange(n_intervals)[None, :, None] < count[:, None, None]
@@ -555,8 +590,8 @@ def evaluate_axisymmetric_field(profile, sigma, points, quadrature=None, n_subdi
         v = xp.where(valid, v, 0.)
         arclength = s0[:, None, None] + d[:, None, None]*xp.sinh(v)
         source = a[:, None, None, :] + arclength[..., None]*t[:, None, None, :]
-        density = xp.asarray(sigma)[seg_idx, None, None] + (arclength/L[:, None, None]) * (
-            xp.asarray(sigma)[seg_idx+1]-xp.asarray(sigma)[seg_idx])[:, None, None]
+        density = sigma_device[seg_idx, None, None] + (arclength/L[:, None, None]) * (
+            sigma_device[seg_idx+1]-sigma_device[seg_idx])[:, None, None]
         w = density * (2*xp.pi*source[..., 0]) * d[:, None, None]*xp.cosh(v) * (
             .5*(hi-lo)/count)[:, None, None] * xp.asarray(gw)[None, None, :]
         er_close, ez_close = ring_field(rho_eval[point_idx, None, None],

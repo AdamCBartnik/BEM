@@ -44,3 +44,8 @@ def resolve_backend(name):
 def to_numpy(array):
     """Bring an array back to numpy/CPU, regardless of which backend produced it."""
     return array.get() if hasattr(array, "get") else np.asarray(array)
+
+
+def array_cache_key(xp):
+    """Keep cached device arrays separate for each CUDA device."""
+    return (xp.__name__, None if xp is np else xp.cuda.runtime.getDevice())

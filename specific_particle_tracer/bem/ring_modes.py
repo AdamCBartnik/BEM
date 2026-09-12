@@ -53,6 +53,9 @@ import numpy as np
 
 from .toroidal import toroidal_Q
 
+_mode_field_fused = None
+_mode_coefficients_fused = None
+
 
 def _chi(rho, z, a, za):
     """chi = (rho^2 + a^2 + (z-za)^2) / (2*rho*a), computed as
@@ -104,17 +107,39 @@ def ring_field_modes(rho, z, a, za, n_max, xp=np):
     )
     chi = _chi(rho, z, a, za)
     q, dq = toroidal_Q(chi, n_max, xp=xp)
+    if xp is np:
+        return _mode_field_arrays(q, dq, rho[None, ...], z[None, ...], a[None, ...], za[None, ...], xp)
+    global _mode_field_fused, _mode_coefficients_fused
+    if _mode_field_fused is None:
+        import cupy as cp
+        _mode_coefficients_fused = cp.fuse(kernel_name="bem_mode_coefficients")(
+            lambda rho, z, a, za: _mode_field_coefficients(rho, z, a, za, cp))
+        _mode_field_fused = cp.fuse(kernel_name="bem_mode_field")(
+            lambda q, dq, pref, cr, cdr, cdz: (pref*q, cr*q+cdr*dq, cdz*dq))
+    # Geometry is independent of harmonic order. Fusing it together with
+    # Q would repeat expensive divisions/square roots for every mode.
+    coefficients = _mode_coefficients_fused(rho, z, a, za)
+    return _mode_field_fused(q, dq, *(c[None, ...] for c in coefficients))
 
+
+def _mode_field_coefficients(rho, z, a, za, xp):
+    pref = xp.sqrt(a / rho) / (2.0 * xp.pi)
+    dchi_drho = (rho**2 - a**2 - (z-za)**2) / (2.0 * a * rho**2)
+    dchi_dz = (z-za) / (a * rho)
+    return pref, -pref/(2.0*rho), pref*dchi_drho, pref*dchi_dz
+
+
+def _mode_field_arrays(q, dq, rho, z, a, za, xp):
     dchi_drho = (rho**2 - a**2 - (z - za) ** 2) / (2.0 * a * rho**2)
     dchi_dz = (z - za) / (a * rho)
     sqrt_pref = xp.sqrt(a / rho)
 
-    Phi = sqrt_pref[None, ...] * q / (2.0 * xp.pi)
+    Phi = sqrt_pref * q / (2.0 * xp.pi)
     dPhi_drho = (
-        -sqrt_pref[None, ...] / (2.0 * rho[None, ...]) * q
-        + sqrt_pref[None, ...] * dq * dchi_drho[None, ...]
+        -sqrt_pref / (2.0 * rho) * q
+        + sqrt_pref * dq * dchi_drho
     ) / (2.0 * xp.pi)
-    dPhi_dz = (sqrt_pref[None, ...] * dq * dchi_dz[None, ...]) / (2.0 * xp.pi)
+    dPhi_dz = (sqrt_pref * dq * dchi_dz) / (2.0 * xp.pi)
     return Phi, dPhi_drho, dPhi_dz
 
 
