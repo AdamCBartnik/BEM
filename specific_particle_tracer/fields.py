@@ -58,6 +58,26 @@ class GunField:
         E[..., 2] = xp.where(z >= 0.0, self.Ez, 0.0)
         return E
 
+    def potential(self, position):
+        """Potential [V] at the given positions: Phi = -Ez*z for z >= 0
+        (so E = -grad(Phi) = Ez*z_hat there, matching `evaluate`), and 0
+        for z < 0 -- physically correct, not just a placeholder, since a
+        grounded perfect conductor's interior sits at exactly its
+        boundary potential (0 V here), the same convention `evaluate`
+        uses for the field.
+
+        Parameters
+        ----------
+        position : ndarray, shape (..., 3)
+
+        Returns
+        -------
+        V : ndarray, shape position.shape[:-1]
+        """
+        xp = self.xp
+        z = position[..., 2]
+        return xp.where(z >= 0.0, -self.Ez * z, 0.0)
+
 
 class HemisphericalTipField:
     """Analytic field for an infinite grounded flat cathode (the half-space
@@ -138,3 +158,30 @@ class HemisphericalTipField:
 
         E = xp.stack([Ex, Ey, Ezz], axis=-1)
         return xp.where(valid[..., None], E, 0.0)
+
+    def potential(self, position):
+        """Potential [V] at the given positions: the classic grounded-
+        sphere-in-uniform-field solution, Phi = -Ez*z*(1 - R^3/r^3),
+        restricted to r >= R, z >= 0 (matches `evaluate`'s E = -grad(Phi)
+        exactly). 0 elsewhere -- physically correct (a grounded
+        conductor's interior sits at its boundary potential, 0 V here),
+        same masking convention as `evaluate`.
+
+        Parameters
+        ----------
+        position : ndarray, shape (..., 3)
+
+        Returns
+        -------
+        V : ndarray, shape position.shape[:-1]
+        """
+        xp = self.xp
+        R = self.R
+        x = position[..., 0]
+        y = position[..., 1]
+        z = position[..., 2]
+        r = xp.sqrt(x * x + y * y + z * z)
+        valid = (r >= R * (1.0 - 1e-6)) & (z >= 0.0)
+        r_safe = xp.where(valid, r, R)
+        V = -self.Ez * z * (1.0 - (R * R * R) / (r_safe * r_safe * r_safe))
+        return xp.where(valid, V, 0.0)

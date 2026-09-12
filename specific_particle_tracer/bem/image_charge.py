@@ -71,8 +71,8 @@ whole point of doing a BEM solve for it). Define sigma_residual by
 
 (a directly solvable BIE -- Q_img = -Q*w(d), fixed once P's position is
 fixed). Since V[sigma_true](x) = -Q*G(x,r0) on S by definition of the true
-problem, subtracting gives V[sigma_residual - sigma_true](x) = Q_img*G(x,
-r_img) on S. Both S[sigma_residual - sigma_true] and Q_img*G(., r_img) are
+problem, subtracting gives V[sigma_residual - sigma_true](x) = -Q_img*G(x,
+r_img) on S. Both S[sigma_residual - sigma_true] and -Q_img*G(., r_img) are
 harmonic in the exterior and decay at infinity, and they agree on the
 boundary S -- so by uniqueness of the exterior Dirichlet problem, they're
 equal *everywhere* in the exterior, not just on S. Hence, evaluated at any
@@ -119,8 +119,8 @@ that the existing z0 image-plane regularization already applies, the same
 one `forces.hemispherical_tip_image_force` uses) are a sizeable fraction
 of the tip's own radius of curvature (R - z0), not orders of magnitude
 smaller. So the benefit is real but modest for *this* shape; it would be
-larger for a sharper (smaller local radius of curvature) feature, and
-smaller still for a flatter one -- something to keep in mind when this
+larger for a flatter (larger local radius of curvature) feature at fixed
+standoff, and smaller for a sharper one -- something to keep in mind when this
 machinery is pointed at a genuinely different tip shape.
 
 A bug this measurement caught along the way, worth remembering: the two
@@ -501,21 +501,72 @@ class ImageChargeBEMSolution:
 
     Build once via `ImageChargeBEMSolution.solve(profile, n_max)`; call
     `.image_field(position, charge, d_lo, d_hi)` per particle position.
+
+    `real_profile`, if given, is the *real* (physical, unrecessed)
+    conductor surface this recessed `profile` was offset from -- used
+    only by `image_potential`'s masking (0 inside the real conductor,
+    see that method's docstring), never in the physics itself. Defaults
+    to `profile` (this solution's own recessed surface) if not given, so
+    passing nothing preserves the old behavior of masking against the
+    recessed surface instead.
     """
 
-    def __init__(self, profile, A, n_max):
+    def __init__(self, profile, A, n_max, real_profile=None):
         self.profile = profile
         self.A = A
         self.n_max = n_max
         self._geom = _segment_endpoints(profile)
+        self.real_profile = profile if real_profile is None else np.asarray(real_profile, dtype=float)
+        self._real_geom = self._geom if real_profile is None else _segment_endpoints(self.real_profile)
         self._rho_floor = 1e-6 * max(np.max(profile[:, 0]), 1e-300)
         self._quad_geom_cache = {}
+        self._A_inv_cache = {}
+        # Set by a caller whose `profile` is mirror-doubled (e.g.
+        # `bem.geometry.HemisphericalTipBEMGeometry` with
+        # `image_mirror_symmetric=True`) to this solution's own mirror
+        # plane z -- lets `image_potential` (and `specific_particle_tracer
+        # .plotting.image_potential_grid`, which reads this automatically)
+        # apply the phantom-mirror-source correction that mode of
+        # `image_force` needs, without every caller having to remember
+        # and pass it by hand. None (default) for an ordinary,
+        # truncated-plane profile, where no such correction applies.
+        self.mirror_plane_z = None
+
+    def _get_A_inv(self, n_max, xp):
+        """Cached inverse of the per-mode operator A[:n_max+1, :P, :P],
+        keyed by (backend, n_max) -- used by `image_force`'s joint solve.
+
+        A is purely geometric (fixed at construction; the per-call RHS is
+        the only thing that ever changes), so factoring it once and
+        reusing that factorization for every subsequent call replaces an
+        O(n_max*P^3) factorization on *every single adaptive step* with
+        an O(n_max*P^2*K) matrix multiply instead. Measured directly on a
+        heavily-refined P=347 profile: this cuts the dominant cost of one
+        `image_force` call's linear solve by ~125x (31.7ms -> 0.25ms),
+        identical to `xp.linalg.solve`'s own answer to machine precision
+        (2e-16 relative) -- worth knowing about if `image_force` still
+        feels slow with a large mesh despite this, since it means the
+        bottleneck has moved elsewhere (see `image_force`'s own profiling
+        notes in this module's docstring).
+
+        Not used by `image_field`/`image_potential`: each of those solves
+        for a genuinely new, one-off single right-hand-side and is a
+        reference/plotting path called rarely, not once per adaptive
+        step -- paying for a full matrix inverse (roughly 2x the cost of
+        one `solve` call) there would be a net loss, not a win.
+        """
+        key = (xp.__name__, n_max)
+        if key not in self._A_inv_cache:
+            P = len(self.profile)
+            A_sub = _to_xp(self.A[: n_max + 1, :P, :P], xp)
+            self._A_inv_cache[key] = xp.linalg.inv(A_sub)
+        return self._A_inv_cache[key]
 
     @classmethod
-    def solve(cls, profile, n_max, refine_ratio=1.0, max_depth=20):
+    def solve(cls, profile, n_max, refine_ratio=1.0, max_depth=20, real_profile=None):
         profile = np.asarray(profile, dtype=float)
         A = assemble_mode_operators(profile, n_max, refine_ratio=refine_ratio, max_depth=max_depth)
-        return cls(profile, A, n_max)
+        return cls(profile, A, n_max, real_profile=real_profile)
 
     def _closest_point(self, rho, z):
         closest, tangent_unit, normal_unit, dist = self._closest_points_batch(
@@ -523,7 +574,7 @@ class ImageChargeBEMSolution:
         )
         return closest[0], tangent_unit[0], normal_unit[0], float(dist[0])
 
-    def _closest_points_batch(self, rho, z, xp=np):
+    def _closest_points_batch(self, rho, z, xp=np, geom=None):
         """Vectorized closest-point-on-profile search for arrays of (rho, z)
         query points -- shape (N,) in, `(closest, tangent_unit, normal_unit,
         dist)` out, shapes (N, 2), (N, 2), (N, 2), (N,).
@@ -534,8 +585,13 @@ class ImageChargeBEMSolution:
         arrays (p0, p1, tangent, normal -- always built as numpy, since the
         profile itself is tiny) with an *xp*-array index (`best_seg`) it
         computes internally; numpy can't be indexed by a cupy array, so
-        those small arrays need converting to xp first when xp is cupy."""
-        p0, p1, tangent, normal = (_to_xp(a, xp) for a in self._geom)
+        those small arrays need converting to xp first when xp is cupy.
+
+        `geom` defaults to this solution's own (recessed) profile
+        geometry; pass `self._real_geom` (as `image_potential`'s masking
+        step does) to search against the real surface instead."""
+        geom = self._geom if geom is None else geom
+        p0, p1, tangent, normal = (_to_xp(a, xp) for a in geom)
         best_dist2, best_seg, best_t, best_normal = _closest_point_on_profile(
             rho, z, p0, p1, tangent, normal, xp
         )
@@ -544,6 +600,69 @@ class ImageChargeBEMSolution:
         tangent_unit = tangent[best_seg] / seg_length
         dist = xp.sqrt(best_dist2)
         return closest, tangent_unit, best_normal, dist
+
+    def _local_mirror_charge_is_valid(self, z_source, dist_to_body, mirror_plane_z, xp=np):
+        """For a mirror-doubled profile only (`mirror_plane_z` set): True
+        where the local mirror-charge trick may be used for a source at
+        height `z_source` standing `dist_to_body` off the meshed profile.
+        False means the *plane* z=mirror_plane_z is the nearest boundary
+        feature, in which case the trick must be skipped (weight 0).
+
+        Two independent things go wrong if it isn't skipped there.
+
+        1. The mirror charge escapes the conductor. The doubled profile
+           closes at its belt (rho=R, z=-z0, where
+           `bem.mesh.hemisphere_tip_image_doubled_profile` joins the two
+           halves) as a *tangential cusp*: both halves arrive with a
+           horizontal tangent, so the closest-point search assigns a
+           near-vertical normal while the revolved surface's true outward
+           direction there is radial. A source out past the rim reflects
+           straight down through that horizontal tangent and lands below
+           the plane at rho > R -- which, unlike in the truncated-plane
+           profile (where that region is meshed material), is *exterior*
+           to the doubled body. The subtraction's exactness argument (see
+           the module docstring's "Exactness") needs the subtracted
+           singularity to lie inside the conductor so the residual stays
+           harmonic in the solve domain; a charge in the vacuum makes the
+           residual unrepresentable by *any* surface density, so the error
+           doesn't shrink with n_max or mesh refinement at all.
+        2. It breaks the antisymmetry the whole doubled construction rests
+           on. That construction is valid because a symmetric body plus an
+           antisymmetric excitation forces V=0 on the mirror plane for
+           free (which is what lets the plane go unmeshed). At the belt
+           the real source and its phantom have the *same* closest point
+           (the cusp itself) but pick up different normals from it, so
+           their two local mirror charges are not mirror images of each
+           other -- measured directly: (53.52, -8.31) vs (55.97, -0.78)
+           nm for a pair that should be exact reflections. The excitation
+           is then no longer antisymmetric, V is no longer 0 on the plane,
+           and the solve answers a different problem than intended.
+
+        Both are avoided by the same test, and it has to be phrased on the
+        *source* rather than on where its mirror charge landed: distance to
+        the plane, |z - mirror_plane_z|, is identical for a source and its
+        phantom (as is distance to the symmetric body), so this decision is
+        guaranteed to come out the same for both and antisymmetry survives.
+        An inside/outside test on the mirror charge itself is *not* safe
+        that way -- signed distance to the nearest segment is unreliable
+        right at a cusp, and it was measured giving opposite answers for a
+        source and its phantom.
+
+        Skipping the trick costs nothing here: in mirror-symmetric mode the
+        phantom mirror source (see `bem.geometry.
+        HemisphericalTipBEMGeometry._mirror_symmetric_image_force`) already
+        *is* the exact plane image, so the plane needs no local
+        approximation of it. Measured against the truncated-plane path at
+        the positions where this triggers: 3e-5 to 6e-4 relative with the
+        trick skipped, versus 0.2 to 33 with it kept.
+
+        `mirror_plane_z` is passed in rather than read off `self`, since
+        `image_field`/`image_potential` let a caller override the stored
+        value per call (including on a solution whose own attribute is
+        None) -- the guard has to follow whichever value that call is
+        actually solving with.
+        """
+        return xp.abs(z_source - mirror_plane_z) > dist_to_body
 
     def _quadrature_geometry(self, n_subdiv):
         """Cached (numpy; converted to xp per call by the caller, matching
@@ -555,7 +674,7 @@ class ImageChargeBEMSolution:
             self._quad_geom_cache[n_subdiv] = _segment_quadrature_geometry(self.profile, n_subdiv)
         return self._quad_geom_cache[n_subdiv]
 
-    def image_field(self, position, charge, d_lo, d_hi, n_max=None):
+    def image_field(self, position, charge, d_lo, d_hi, n_max=None, mirror_plane_z=None):
         """The image-charge (induced-field) contribution at `position`
         (shape (3,)) due to a point charge `charge` there, excluding the
         real charge's own singular self-field -- i.e. exactly the field
@@ -563,6 +682,13 @@ class ImageChargeBEMSolution:
         module docstring: this is exact (given `n_max`, `d_lo`, `d_hi`)
         in the sense that the *converged* (large n_max) answer doesn't
         depend on d_lo/d_hi at all, only how quickly it converges does.
+
+        `mirror_plane_z` : same meaning, and same "defaults to
+        `self.mirror_plane_z`" behavior, as `image_potential`'s own
+        parameter of the same name -- see that method's docstring. Needed
+        for the same reason there: on a mirror-doubled (closed, no-plane)
+        `self.profile`, the phantom mirror source's own direct field is a
+        genuine classical method-of-images term, not optional.
 
         Units: every kernel in this module (and in bem.ring_modes/
         bem.toroidal/bem.axisymmetric) uses G = 1/(4*pi*r), i.e. natural
@@ -599,6 +725,7 @@ class ImageChargeBEMSolution:
         E : array, shape (3,)
         """
         n_max = self.n_max if n_max is None else n_max
+        mirror_plane_z = self.mirror_plane_z if mirror_plane_z is None else mirror_plane_z
         x0, y0, z0 = position
         rho0 = float(np.hypot(x0, y0))
         phi0 = float(np.arctan2(y0, x0))
@@ -610,12 +737,19 @@ class ImageChargeBEMSolution:
         else:
             w = 0.0
 
+        if mirror_plane_z is not None and not self._local_mirror_charge_is_valid(z0, dist, mirror_plane_z):
+            w = 0.0  # see _local_mirror_charge_is_valid
         rho_img, z_img, side = mirror_point(rho0_safe, z0, closest, tangent_unit, normal_unit)
         q_img = -charge * w
 
         profile_rho = np.maximum(self.profile[:, 0], self._rho_floor)
         profile_z = self.profile[:, 1]
         g_real = charge * point_charge_potential_modes(profile_rho, profile_z, rho0_safe, z0, n_max)
+        if mirror_plane_z is not None:
+            z_mirror_source = 2.0 * mirror_plane_z - z0
+            g_real = g_real - charge * point_charge_potential_modes(
+                profile_rho, profile_z, rho0_safe, z_mirror_source, n_max
+            )
         if w > 0.0:
             mode_sign = np.ones(n_max + 1) if side > 0 else (-1.0) ** np.arange(n_max + 1)
             g_img = q_img * point_charge_potential_modes(
@@ -653,12 +787,17 @@ class ImageChargeBEMSolution:
         else:
             E_img = np.zeros(3)
 
+        if mirror_plane_z is not None:
+            E_mirror_source = _point_charge_field(rho0_safe, phi0, z0, rho0_safe, phi0, z_mirror_source, -charge)
+        else:
+            E_mirror_source = np.zeros(3)
+
         on_axis = rho0 <= self._rho_floor
         if on_axis:
             E_residual = np.array([0.0, 0.0, E_residual[2]])
-        return (E_residual + E_img) / VACUUM_PERMITTIVITY
+        return (E_residual + E_img + E_mirror_source) / VACUUM_PERMITTIVITY
 
-    def image_force(self, position, charge, active, d_lo, d_hi, n_max=None, n_subdiv=4, xp=np):
+    def image_force(self, position, charge, active, d_lo, d_hi, n_max=None, n_subdiv=4, n_eval=None, xp=np):
         """Batched image-charge *force* (matching the calling convention of
         `forces.image_charge_force`/`forces.hemispherical_tip_image_force`,
         for use as a `geometry.Geometry.image_force` implementation), via a
@@ -723,19 +862,50 @@ class ImageChargeBEMSolution:
         n_subdiv : int, optional
             Fixed-quadrature resolution for the field-reconstruction step
             (see `_field_from_joint_mode_density_batch`); doesn't affect
-            the operator assembly (always adaptive, see `solve`).
+            the operator assembly (always adaptive, see `solve`). Needed
+            mainly to resolve density variation *within* one profile
+            segment -- once the profile itself is heavily refined (many,
+            short segments), that variation is already small, so a much
+            smaller n_subdiv than the default costs little accuracy for a
+            real per-call speedup (this reconstruction step dominates
+            `image_force`'s cost once the profile is large enough that
+            the linear solve itself is no longer the bottleneck -- see
+            `_get_A_inv`). Measured directly on a P=347 profile: n_subdiv=1
+            (1384 quadrature points) differs from n_subdiv=8 (11072
+            points) by ~5.6e-10 relative, while cutting this step's own
+            cost roughly in proportion to the point count (measured
+            ~1.8x faster end-to-end at n_subdiv=1 vs. the default 4).
+            Worth checking with your own profile before assuming the
+            default is the right tradeoff at a large P.
+        n_eval : int, optional
+            Evaluate (and return) the force only for the first `n_eval` of
+            each group's sources; all of them still excite the solve.
+            Default None = all of them, the ordinary case. This exists for
+            `bem.geometry.HemisphericalTipBEMGeometry.
+            _mirror_symmetric_image_force`, which appends one *phantom*
+            source per real particle purely to shape the excitation and
+            has no use for the phantoms' own "forces" -- computing them
+            anyway wasted roughly half of the field-reconstruction step
+            (the `O(n_max * G * E * n_quad)` term that dominates once the
+            profile is large, see `n_subdiv` above) plus half the
+            all-pairs mirror sum. The RHS assembly and the linear solve
+            are untouched by this, since those genuinely need every
+            source.
         xp : module, optional
             numpy or cupy. `position`/`charge`/`active` may already be on
             either module (or plain Python/numpy, which is always safe to
             hand to either); everything from here on runs on `xp`,
-            including the per-mode linear solve (`xp.linalg.solve`) --
+            including the per-mode joint solve (`_get_A_inv` -- a cached
+            matrix inverse, not a fresh `xp.linalg.solve` per call, see
+            that method's own docstring for why and by how much) --
             unlike `image_field` (kept numpy-only, a validated reference/
             special case, see module docstring), this is the path meant to
             actually run on GPU for a simulation with many particles.
 
         Returns
         -------
-        force : array (xp), shape (n_groups, n_emit, 3)
+        force : array (xp), shape (n_groups, n_emit, 3) -- or
+            (n_groups, n_eval, 3) if `n_eval` was given.
 
         Note on exact on-axis or exact phi=0 query points: a transverse
         force component that's mathematically zero by symmetry there (the
@@ -803,6 +973,8 @@ class ImageChargeBEMSolution:
             w = image_charge_weight(dist, d_lo, d_hi, xp=xp)
         else:
             w = xp.zeros_like(dist)
+        if self.mirror_plane_z is not None:
+            w = xp.where(self._local_mirror_charge_is_valid(z.reshape(-1), dist, self.mirror_plane_z, xp=xp), w, 0.0)
         rho_img, z_img, side = mirror_points_batch(
             rho_safe.reshape(-1), z.reshape(-1), closest, tangent_unit, normal_unit, xp=xp
         )
@@ -839,26 +1011,33 @@ class ImageChargeBEMSolution:
         # its OWN solve -- rather than broadcasting A across a new G axis
         # (which would mean G copies of an (n_max+1, P, P) array), put
         # (group, cos/sin) into the "many right-hand-sides" trailing axis
-        # of one ordinary batched solve, matching xp.linalg.solve's native
-        # (..., M, M), (..., M, K) form with no replication of A at all.
+        # of one ordinary batched matrix multiply (see `_get_A_inv`: A
+        # never changes call to call, only this RHS does, so its inverse
+        # is computed once and cached rather than re-factored -- measured
+        # ~125x faster than xp.linalg.solve for a heavily-refined mesh,
+        # identical to machine precision) with no replication of A at all.
         rhs = xp.stack([rhs_c, rhs_s], axis=-1)  # (n_max+1, G, P, 2)
         rhs = xp.moveaxis(rhs, 1, 2).reshape(n_max + 1, P, G * 2)  # (n_max+1, P, G*2)
-        A = _to_xp(self.A[: n_max + 1, :P, :P], xp)
-        sigma = xp.linalg.solve(A, rhs)  # (n_max+1, P, G*2)
+        A_inv = self._get_A_inv(n_max, xp)
+        sigma = xp.matmul(A_inv, rhs)  # (n_max+1, P, G*2)
         sigma = xp.moveaxis(sigma.reshape(n_max + 1, P, G, 2), 1, 2)  # (n_max+1, G, P, 2)
         sigma_C, sigma_S = sigma[..., 0], sigma[..., 1]
 
+        # Every source excites the solve above (that's the whole point of a
+        # joint solve), but the force only has to be *evaluated* at the
+        # first `n_eval` of them -- see this method's `n_eval` docs.
+        ev = slice(None) if n_eval is None else slice(0, n_eval)
         E_residual = self._field_from_joint_mode_density_batch(
-            sigma_C, sigma_S, rho_safe, phi, z, n_max, xp=xp, n_subdiv=n_subdiv
-        )  # (G, E, 3)
+            sigma_C, sigma_S, rho_safe[:, ev], phi[:, ev], z[:, ev], n_max, xp=xp, n_subdiv=n_subdiv
+        )  # (G, n_eval, 3)
 
-        query_xyz = _cylindrical_to_cartesian(rho_safe, phi, z, xp=xp)  # (G, E, 3)
+        query_xyz = _cylindrical_to_cartesian(rho_safe[:, ev], phi[:, ev], z[:, ev], xp=xp)  # (G, n_eval, 3)
         mirror_xyz = _cylindrical_to_cartesian(rho_img, phi_img, z_img, xp=xp)  # (G, E, 3)
-        E_mirror = _point_charge_field_batch_all_pairs(query_xyz, mirror_xyz, q_img, xp=xp)  # (G, E, 3)
+        E_mirror = _point_charge_field_batch_all_pairs(query_xyz, mirror_xyz, q_img, xp=xp)  # (G, n_eval, 3)
 
         E_total = (E_residual + E_mirror) / VACUUM_PERMITTIVITY
-        force = q_eff[..., None] * E_total
-        return xp.where(active_xp[..., None], force, 0.0)
+        force = q_eff[:, ev, None] * E_total
+        return xp.where(active_xp[:, ev, None], force, 0.0)
 
     def _field_from_mode_density(self, sigma_m, rho, phi, z, n_max):
         """Field E = -grad[S[sum_m sigma_m*cos(m*phi')]] at (rho, phi, z),
@@ -895,6 +1074,198 @@ class ImageChargeBEMSolution:
         Ex = E_rho * np.cos(phi) - E_phi * np.sin(phi)
         Ey = E_rho * np.sin(phi) + E_phi * np.cos(phi)
         return np.array([Ex, Ey, E_z])
+
+    def _potential_from_mode_density_batch(self, sigma_m, rho, phi, z, n_max):
+        """Vectorized generalization of `_field_from_mode_density` to many
+        query points at once, and to potential rather than field -- a
+        much simpler reconstruction, since there's no derivative
+        bookkeeping needed: V = sum_m [sum_segments dens*seg_len*Phi_m] *
+        cos(m*phi), via `ring_potential_modes` (the same Phi_m
+        `_field_from_mode_density` gets as a side effect of
+        `ring_field_modes`, just without paying for the unused
+        derivatives).
+
+        sigma_m : shape (n_max+1, n_profile), single-source (cosine-only)
+            residual density in the source's own phi'=0 rotated frame.
+        rho, phi, z : 1D arrays, length N -- phi is measured *relative to
+            that same rotated frame* (i.e. query phi minus source phi),
+            not the lab-frame azimuth (see `image_potential`).
+
+        Returns
+        -------
+        V : array, shape (N,)
+        """
+        p0, p1, tangent, normal = self._geom
+        n_seg = len(p0)
+        N = rho.shape[0]
+        v_m = np.zeros((n_max + 1, N))
+        for j in range(n_seg):
+            for xi, wi in zip(_GAUSS_X, _GAUSS_W):
+                t = 0.5 * (xi + 1.0)
+                rho_s = p0[j, 0] + t * (p1[j, 0] - p0[j, 0])
+                z_s = p0[j, 1] + t * (p1[j, 1] - p0[j, 1])
+                seg_len = np.linalg.norm(tangent[j]) * 0.5 * wi
+                s0 = sigma_m[:, j]
+                s1 = sigma_m[:, j + 1]
+                dens = s0 + t * (s1 - s0)  # (n_max+1,)
+                Phi = ring_potential_modes(rho, z, rho_s, z_s, n_max)  # (n_max+1, N)
+                v_m += (dens * seg_len)[:, None] * Phi
+
+        m = np.arange(n_max + 1)
+        cos_m_phi = np.cos(m[:, None] * phi[None, :])  # (n_max+1, N)
+        return np.sum(v_m * cos_m_phi, axis=0)  # (N,)
+
+    def image_potential(self, source_position, source_charge, query_position, d_lo, d_hi, n_max=None, mirror_plane_z=None):
+        """Potential [V] due to the conductor's induced response (mode-
+        solve residual + mirror charge) to ONE point charge, evaluated at
+        arbitrary `query_position` points -- unlike `image_force`/
+        `image_field` (which only ever evaluate at the source's own
+        location, since that's what a particle's own dynamics needs),
+        decoupling query from source is what visualizing the induced
+        potential over a whole region needs (see `bem.plotting`).
+
+        Shares `image_field`'s exact single-source solve (rotated frame,
+        source at phi'=0, cosine-only series -- see its docstring for the
+        derivation and unit convention), just reconstructing a scalar
+        potential at arbitrary points afterward instead of a field vector
+        at the source's own position. Numpy-only, like `image_field` (a
+        reference/plotting path, not a hot loop).
+
+        Parameters
+        ----------
+        source_position : array, shape (3,)
+        source_charge : float
+        query_position : array, shape (..., 3)
+        d_lo, d_hi : float
+            Same meaning as `image_force`/`image_field`.
+        n_max : int, optional
+            Defaults to this solution's full precomputed mode count.
+        mirror_plane_z : float, optional
+            This solution's own mirror plane (e.g. -z0, matching
+            `bem.mesh.hemisphere_tip_image_doubled_profile`'s) when
+            `self.profile` is a *mirror-doubled* (closed, no-plane)
+            profile -- adds a phantom source (-source_charge, at
+            source_position reflected through z=mirror_plane_z) to the
+            excitation, both in the solve's own right-hand side and as a
+            direct Coulomb term at each query point, exactly the
+            correction `bem.geometry.HemisphericalTipBEMGeometry.
+            _mirror_symmetric_image_force` applies for `image_force` (see
+            that method's own docstring for why it isn't optional: a
+            classical method-of-images "plane image" term, not something
+            the mode solve alone reproduces without it). Since a pure
+            z-reflection doesn't change (rho, phi), the phantom sits at
+            the *same* phi'=0 as the real source in this method's own
+            rotated frame, so no extra frame-rotation bookkeeping is
+            needed beyond what's already here for the real source.
+            Defaults to `self.mirror_plane_z` (None for an ordinary
+            truncated-plane profile; set automatically to the right
+            value by `HemisphericalTipBEMGeometry` when it built this
+            solution with `image_mirror_symmetric=True`) -- pass this
+            explicitly only to override that.
+
+        Returns
+        -------
+        V : array, shape query_position.shape[:-1]. 0 inside the *real*
+            conductor (see `real_profile` in the class docstring; falls
+            back to this solution's own recessed profile if none was
+            given) -- not just a masked-out placeholder: that's also the
+            physically correct value there (a grounded conductor's
+            interior sits at its own boundary potential), and it avoids
+            ever exposing the genuine divergence at the mirror charge's
+            own location, which sits inside the real material too (on
+            the far side of the recessed surface from any real
+            particle).
+        """
+        n_max = self.n_max if n_max is None else n_max
+        mirror_plane_z = self.mirror_plane_z if mirror_plane_z is None else mirror_plane_z
+        x0, y0, z0 = source_position
+        rho0 = float(np.hypot(x0, y0))
+        phi0 = float(np.arctan2(y0, x0))
+        rho0_safe = max(rho0, self._rho_floor)
+
+        closest, tangent_unit, normal_unit, dist = self._closest_point(rho0_safe, z0)
+        if d_hi > d_lo:
+            w = image_charge_weight(dist, d_lo, d_hi)
+        else:
+            w = 0.0
+        if mirror_plane_z is not None and not self._local_mirror_charge_is_valid(z0, dist, mirror_plane_z):
+            w = 0.0  # see _local_mirror_charge_is_valid
+        rho_img, z_img, side = mirror_point(rho0_safe, z0, closest, tangent_unit, normal_unit)
+        q_img = -source_charge * w
+
+        profile_rho = np.maximum(self.profile[:, 0], self._rho_floor)
+        profile_z = self.profile[:, 1]
+        g_real = source_charge * point_charge_potential_modes(profile_rho, profile_z, rho0_safe, z0, n_max)
+        if mirror_plane_z is not None:
+            z_mirror_source = 2.0 * mirror_plane_z - z0
+            g_real = g_real - source_charge * point_charge_potential_modes(
+                profile_rho, profile_z, rho0_safe, z_mirror_source, n_max
+            )
+        if w > 0.0:
+            mode_sign = np.ones(n_max + 1) if side > 0 else (-1.0) ** np.arange(n_max + 1)
+            g_img = q_img * point_charge_potential_modes(
+                profile_rho, profile_z, rho_img, z_img, n_max
+            ) * mode_sign[:, None]
+        else:
+            g_img = 0.0
+        rhs = -(g_real + g_img)  # shape (n_max+1, n)
+        A = self.A[: n_max + 1, : len(self.profile), : len(self.profile)]
+        sigma_residual = np.linalg.solve(A, rhs[..., None])[..., 0]  # (n_max+1, n) -- same solve as image_field
+
+        query_position = np.asarray(query_position, dtype=float)
+        out_shape = query_position.shape[:-1]
+        flat = query_position.reshape(-1, 3)
+        qx, qy, qz = flat[:, 0], flat[:, 1], flat[:, 2]
+        rho_q = np.hypot(qx, qy)
+        phi_q = np.arctan2(qy, qx)
+        rho_q_safe = np.maximum(rho_q, self._rho_floor)
+
+        # Reconstruct at the query points' angle *relative to the source*
+        # (the frame the solve above was built in) -- a scalar potential
+        # needs no "rotate the answer back" step the way image_field's
+        # field vector does.
+        V_residual = self._potential_from_mode_density_batch(sigma_residual, rho_q_safe, phi_q - phi0, qz, n_max)
+
+        if w > 0.0:
+            phi_img = phi0 if side > 0 else phi0 + np.pi
+            d = np.sqrt(
+                rho_q_safe**2 + rho_img**2 - 2.0 * rho_q_safe * rho_img * np.cos(phi_q - phi_img) + (qz - z_img) ** 2
+            )
+            V_img = q_img / (4.0 * np.pi * d)
+        else:
+            V_img = 0.0
+
+        if mirror_plane_z is not None:
+            # Direct Coulomb term from the phantom mirror source, same
+            # (rho0, phi0) as the real source (a pure z-reflection).
+            d_mirror_source = np.sqrt(rho_q_safe**2 + rho0_safe**2 - 2.0 * rho_q_safe * rho0_safe * np.cos(phi_q - phi0) + (qz - z_mirror_source) ** 2)
+            V_mirror_source = -source_charge / (4.0 * np.pi * d_mirror_source)
+        else:
+            V_mirror_source = 0.0
+
+        V = (V_residual + V_img + V_mirror_source) / VACUUM_PERMITTIVITY
+
+        # 0 inside the *real* (physical, unrecessed) conductor -- not
+        # this solution's own recessed image profile. No real particle
+        # ever occupies the thin sliver between the two (that's the
+        # whole point of z0 -- see module docstring), so the recessed
+        # surface has no physical meaning to mask against; the real one
+        # does, and 0 is the physically correct value there (a grounded
+        # conductor's interior sits at its own boundary potential), not
+        # just a mask. (This also hides the mirror charge's own
+        # divergence, which sits on the material side of the recessed
+        # surface -- deeper inside the real conductor too, so this test
+        # still catches it.) `_closest_points_batch`'s normal_unit points
+        # toward the vacuum side by construction (confirmed directly:
+        # positive signed distance off a profile point matches known-
+        # vacuum test points, negative matches known-material ones), so a
+        # negative signed distance off the real profile is exactly
+        # "inside," same test as before but against `self._real_geom`.
+        closest_q, tangent_q, normal_q, _ = self._closest_points_batch(rho_q_safe, qz, geom=self._real_geom)
+        signed_dist = np.sum((np.stack([rho_q_safe, qz], axis=-1) - closest_q) * normal_q, axis=-1)
+        V = np.where(signed_dist < 0.0, 0.0, V)
+
+        return V.reshape(out_shape)
 
     def _field_from_joint_mode_density_batch(self, sigma_C, sigma_S, rho_q, phi_q, z_q, n_max, xp=np, n_subdiv=4):
         """Vectorized generalization of the single-particle field

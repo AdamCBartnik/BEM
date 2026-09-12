@@ -6,27 +6,27 @@ the Dirichlet data g = Ez*z has no azimuthal (phi) dependence, so neither
 does the solved surface charge density sigma. That means the azimuthal
 integral in the 3D single-layer potential/field kernels can be done
 *analytically* (via complete elliptic integrals) instead of numerically,
-collapsing the problem from a full 2D surface mesh (bem.mesh, bem.laplace,
-bem.panel_field) to a 1D mesh of the generating profile alone -- typically
-tens of unknowns here instead of thousands, and (since the phi integral is
-now exact rather than a discretized sum over n_phi panels) a much smoother
-field as a function of position, which matters for an adaptive ODE
-integrator stepping through it.
+collapsing the problem from a full 2D surface mesh to a 1D mesh of the
+generating profile alone -- typically tens of unknowns here instead of
+thousands, and (since the phi integral is now exact rather than a
+discretized sum over azimuthal panels) a much smoother field as a
+function of position, which matters for an adaptive ODE integrator
+stepping through it.
 
 This only works because the excitation is axisymmetric, not merely because
 the geometry is: a uniform field along the symmetry axis has Dirichlet
 data with no phi-dependence, so the induced charge has none either. That
 holds for any future axisymmetric real-cathode shape sitting in an
-on-axis field, not just this hemisphere-tip case. It will *not* hold for
-the image-charge job, even on the (still axisymmetric) recessed surface:
-the excitation there is a real particle at some generally off-axis 3D
-position, which breaks the rotational symmetry of the induced image
-charge regardless of the surface's own symmetry -- so that job should
-default to the general 3D machinery (bem.mesh/bem.panel_field), not try
-to force a 1D reduction here. (A middle ground exists if 3D turns out too
-slow there too: decompose the off-axis excitation into azimuthal Fourier
-modes and solve one 1D problem per mode -- more moving parts, so a
-fallback optimization, not a starting point.)
+on-axis field, not just this hemisphere-tip (or cylindrical-well) case. It
+does *not* hold for the image-charge job, even on the (still axisymmetric)
+recessed surface: the excitation there is a real particle at some
+generally off-axis 3D position, which breaks the rotational symmetry of
+the induced image charge regardless of the surface's own symmetry -- see
+`bem.image_charge`/`bem.toroidal` for the azimuthal-Fourier-mode
+decomposition (one 1D problem per mode) that job actually uses instead.
+An earlier general 3D triangulated-mesh path (via bempp-cl) was tried
+first and dropped -- see git history -- once the 1D reductions above
+covered every geometry this project actually needed.
 
 Physics
 -------
@@ -72,42 +72,24 @@ equation and the field evaluation are 1D integrals of sigma(s) * rho(s) *
 ring_potential(...)/ring_field(...) along the profile, with sigma
 represented piecewise-linearly (P1) between profile nodes.
 
-As with bem.panel_field's Coulomb kernel, the *field* kernel here doesn't
-enjoy the cancellation that keeps the *potential* kernel's self term
-(a log singularity, confirmed to converge cleanly under adaptive
-subdivision) well-behaved: near the profile, it's the same "summing
-large, nearly-canceling contributions" problem hit in 3D. Fixed the same
-way: shift the density by its value at the true closest point on the
-profile (found by exact point-to-segment projection, not just the nearest
-node) before summing, and add back that reference density's exact
-local-infinite-sheet contribution, sigma_ref * n(x) -- applied only within
-a small fraction of one profile-segment's size, since (checked
-empirically, as in the 3D version) the local-reference approximation is
-actively worse than plain summation beyond that.
+Near-surface field evaluation
+-----------------------------
+Potential assembly uses adaptive segment quadrature. Field evaluation uses
+cached fixed quadrature for distant segments and a sinh change of variables
+for nearby ones, resolving the actual single-layer integral on the actual
+surface. No global constant density is removed or replaced by a planar
+field. Exactly-on-surface queries use an exterior displacement proportional
+to the local element length; polygon corners have no unique finite trace
+for arbitrary charge density. Refining the profile controls that geometric
+approximation. Both quadrature paths are vectorized on NumPy and CuPy.
 
-Vectorization
--------------
-The one-time BEM *solve* (collocation matrix assembly) keeps the original
-adaptive-subdivision quadrature (`_segment_potential`): it runs once per
-geometry construction, is not a bottleneck, and the potential's self-term
-needs genuine adaptivity to converge quickly (checked directly: a fixed,
-non-adaptive quadrature converges to the same self-term value only very
-slowly, unlike the adaptive one).
-
-Field *evaluation* -- called repeatedly by the tracker's ODE integrator,
-potentially for many points at once -- instead uses a fixed (non-adaptive)
-quadrature built once over the whole profile and cached, so every
-subsequent call is a single batched (n_points, n_quadrature_points)
-broadcast: no per-point, per-segment Python loop, and no data-dependent
-branching (subdivide-or-not) that would defeat GPU execution. Evaluating
-a point exactly on top of a quadrature node is never required for this
-fixed quadrature (the near-surface case is handled by the reference-shift
-trick instead), so the lack of adaptivity here doesn't cost accuracy.
 """
 
 import numpy as np
 
-from ._elliptic import ellip_ke as _ellip_ke
+from ._elliptic import ellip_ke as _ellip_ke, ellip_ke_complement
+
+_NEAR_GAUSS_X, _NEAR_GAUSS_W = np.polynomial.legendre.leggauss(8)
 
 # 3-point (not the solve's 4-point) fixed Gauss-Legendre rule used per
 # quadrature sub-panel in the cached field-evaluation quadrature.
@@ -240,37 +222,29 @@ def ring_potential(rho, z, a, xp=np):
     convention) -- see module docstring. Arguments broadcast as ordinary
     array arithmetic; `xp` is numpy or cupy."""
     D = (rho + a) ** 2 + z**2
-    m = xp.clip(4.0 * a * rho / D, 0.0, 1.0 - 1e-12)
-    K, _ = _ellip_ke(m, xp)
+    p = ((rho - a)**2 + z**2) / D
+    K, _ = ellip_ke_complement(p, xp)
     return K / (2.0 * xp.pi**2 * xp.sqrt(D))
 
 
 def ring_field(rho, z, a, xp=np):
-    """Field (E_rho, E_z) at cylindrical (rho, z) of a unit-total-charge
-    ring of radius a centered on the z-axis at height 0. Arguments
-    broadcast as ordinary array arithmetic."""
-    D = (rho + a) ** 2 + z**2
-    m = xp.clip(4.0 * a * rho / D, 0.0, 1.0 - 1e-12)
-    K, E = _ellip_ke(m, xp)
-    sqrtD = xp.sqrt(D)
+    """Field of a unit-charge ring, with a stable near-ring complement.
 
-    dD_drho = 2.0 * (rho + a)
-    dD_dz = 2.0 * z
-    dm_drho = (4.0 * a * D - 4.0 * a * rho * dD_drho) / D**2
-    dm_dz = (-4.0 * a * rho * dD_dz) / D**2
-
-    # dK/dm = (E - (1-m)K) / (2m(1-m)); removable 0/0 at m=0 (limit pi/8,
-    # from K's power series). m_safe avoids a division by ~0 feeding NaN
-    # into the branch xp.where discards (xp.where evaluates both sides).
-    on_axis = m < 1e-9
-    m_safe = xp.where(on_axis, 0.5, m)  # arbitrary safe value; result discarded by xp.where below
-    dK_dm_general = (E - (1.0 - m_safe) * K) / (2.0 * m_safe * (1.0 - m_safe))
-    dK_dm = xp.where(on_axis, xp.pi / 8.0, dK_dm_general)
-
-    scale = 2.0 * xp.pi**2  # matches ring_potential's normalization
-    dV_drho = (dK_dm * dm_drho) / (scale * sqrtD) - K * dD_drho / (2.0 * scale * D**1.5)
-    dV_dz = (dK_dm * dm_dz) / (scale * sqrtD) - K * dD_dz / (2.0 * scale * D**1.5)
-    return -dV_drho, -dV_dz
+    The small distance squared is computed directly, not as 1-m after
+    rounding m almost to one. The axis uses the first terms of its regular
+    Taylor expansion to avoid cancellation in the radial component.
+    """
+    D = (rho + a)**2 + z**2
+    d2 = (rho - a)**2 + z**2
+    K, E = ellip_ke_complement(d2 / D, xp)
+    near_axis = rho**2 < 1e-10 * (a*a + z*z)
+    rho_safe = xp.where(near_axis, 1.0, rho)
+    er = (K - (a*a - rho*rho + z*z) * E / d2) / (4*xp.pi**2*rho_safe*xp.sqrt(D))
+    ez = z * E / (2*xp.pi**2*xp.sqrt(D)*d2)
+    axis_d2 = a*a + z*z
+    er_axis = rho * (2*z*z - a*a) / (8*xp.pi*axis_d2**2.5)
+    ez_axis = z/(4*xp.pi*axis_d2**1.5) + 3*rho*rho*z*(3*a*a-2*z*z)/(16*xp.pi*axis_d2**3.5)
+    return xp.where(near_axis, er_axis, er), xp.where(near_axis, ez_axis, ez)
 
 
 def _subdivide(b0, b1, b2):
@@ -478,7 +452,7 @@ class AxisymmetricBEMSolution:
 
     def field(self, points, n_subdiv=8, xp=np):
         """Field E = -grad(potential) at `points`, shape (..., 3), via the
-        vectorized fixed-quadrature evaluator (see module docstring).
+        vectorized fixed/near-segment quadrature (see module docstring).
 
         Returns
         -------
@@ -522,41 +496,75 @@ def evaluate_axisymmetric_field(profile, sigma, points, quadrature=None, n_subdi
         quadrature = _fixed_quadrature(profile, sigma, n_subdiv)
     rho_q, z_q, area_q, sigma_q = (xp.asarray(a) for a in quadrature)
 
-    p0, p1, tangent, normal = _segment_endpoints(profile)
-    seg_sigma0, seg_sigma1 = xp.asarray(sigma[:-1]), xp.asarray(sigma[1:])
-
+    p0_np, p1_np, tangent_np, normal_np = _segment_endpoints(profile)
+    lengths = xp.asarray(np.linalg.norm(tangent_np, axis=-1))
+    p0, tangent = (xp.asarray(a) for a in (p0_np, tangent_np))
+    unit = tangent / lengths[:, None]
     points = xp.asarray(points, dtype=float)
     shape = points.shape
     flat = points.reshape(-1, 3)
-    x, y, z = flat[:, 0], flat[:, 1], flat[:, 2]
-    rho = xp.hypot(x, y)
-    phi = xp.arctan2(y, x)
+    rho = xp.hypot(flat[:, 0], flat[:, 1])
+    z = flat[:, 2].copy()
+    phi = xp.arctan2(flat[:, 1], flat[:, 0])
+    if not flat.shape[0]:
+        return xp.empty_like(points)
 
-    # 0.1x (not, say, 0.5x): checked empirically against the analytic
-    # hemisphere solution -- much beyond this the regularized branch is
-    # *worse* than plain summation would be at that same distance (its
-    # "local reference density" approximation is only good very close in),
-    # so a generous threshold actively hurts otherwise-accurate points
-    # near, but not that near, the surface.
-    segment_lengths = np.linalg.norm(p1 - p0, axis=-1)
-    near_surface_threshold = 0.1 * np.sqrt(np.mean(segment_lengths**2))
-
-    best_dist2, best_seg, best_t, best_normal = _closest_point_on_profile(
-        rho, z, p0, p1, tangent, normal, xp
+    # A single-layer field jumps across the surface. Exactly on it, take
+    # the exterior trace using a small local-mesh-scaled displacement.
+    # At polygon vertices this specifies a finite one-sided value; the
+    # continuum value there is not defined for an arbitrary nodal density.
+    dist2, seg, _, normals = _closest_point_on_profile(
+        rho, z, p0_np, p1_np, tangent_np, normal_np, xp
     )
-    sigma_at_closest = seg_sigma0[best_seg] + best_t * (seg_sigma1[best_seg] - seg_sigma0[best_seg])
-    near_surface = best_dist2 < near_surface_threshold**2
-    sigma_ref = xp.where(near_surface, sigma_at_closest, 0.0)
+    offset = xp.where(dist2 < (1e-9*lengths[seg])**2, 1e-4*lengths[seg], 0.0)
+    rho_eval = rho + offset * normals[:, 0]
+    rho_eval = xp.where(rho == 0., 0., rho_eval)
+    z = z + offset * normals[:, 1]
 
-    # (M, Q) broadcast: field from every quadrature node, density shifted
-    # per-point by that point's own sigma_ref.
-    e_rho_q, e_z_q = ring_field(rho[:, None], z[:, None] - z_q[None, :], rho_q[None, :], xp=xp)
-    weight = (sigma_q[None, :] - sigma_ref[:, None]) * area_q[None, :]
-    e_rho = xp.sum(weight * e_rho_q, axis=-1) + sigma_ref * best_normal[:, 0]
-    e_z = xp.sum(weight * e_z_q, axis=-1) + sigma_ref * best_normal[:, 1]
+    # Keep cached fixed quadrature for well-separated point/segment pairs.
+    er, ez = ring_field(rho_eval[:, None], z[:, None]-z_q[None, :], rho_q[None, :], xp)
+    weight = area_q * sigma_q
+    n_seg = len(p0_np)
+    er_seg = (er*weight[None, :]).reshape(-1, n_seg, len(rho_q)//n_seg).sum(axis=-1)
+    ez_seg = (ez*weight[None, :]).reshape(-1, n_seg, len(rho_q)//n_seg).sum(axis=-1)
 
-    on_axis = rho <= 1e-15
-    ex = xp.where(on_axis, 0.0, e_rho * xp.cos(phi))
-    ey = xp.where(on_axis, 0.0, e_rho * xp.sin(phi))
-    result = xp.stack([ex, ey, e_z], axis=-1)
-    return result.reshape(shape)
+    delta = xp.stack([rho_eval, z], axis=-1)[:, None, :] - p0[None, :, :]
+    along = xp.sum(delta * unit[None, :, :], axis=-1)
+    projection = xp.clip(along, 0., lengths[None, :])
+    distance = xp.linalg.norm(delta - projection[..., None]*unit[None, :, :], axis=-1)
+    point_idx, seg_idx = xp.nonzero(distance < lengths[None, :])
+    if point_idx.size:
+        # For each close pair, s = s_closest + d*sinh(v) resolves the
+        # narrow peak with O(log(length/d)) quadrature nodes. All close
+        # pairs are evaluated in one batch on either CPU or GPU.
+        a = p0[seg_idx]
+        t = unit[seg_idx]
+        L = lengths[seg_idx]
+        s0 = projection[point_idx, seg_idx]
+        d = xp.maximum(distance[point_idx, seg_idx], 1e-15*L)
+        lo = xp.arcsinh(-s0/d)
+        hi = xp.arcsinh((L-s0)/d)
+        # Gauss-8 per v interval of width at most 0.5.
+        count = xp.maximum(1, xp.ceil((hi-lo)/.5).astype(xp.int64))
+        n_intervals = int(xp.max(count))
+        gx, gw = _NEAR_GAUSS_X, _NEAR_GAUSS_W
+        v = lo[:, None, None] + (xp.arange(n_intervals)[None, :, None] +
+            .5*(xp.asarray(gx)[None, None, :]+1.)) * ((hi-lo)/count)[:, None, None]
+        valid = xp.arange(n_intervals)[None, :, None] < count[:, None, None]
+        # Clamp padded intervals before sinh to avoid overflow in unused nodes.
+        v = xp.where(valid, v, 0.)
+        arclength = s0[:, None, None] + d[:, None, None]*xp.sinh(v)
+        source = a[:, None, None, :] + arclength[..., None]*t[:, None, None, :]
+        density = xp.asarray(sigma)[seg_idx, None, None] + (arclength/L[:, None, None]) * (
+            xp.asarray(sigma)[seg_idx+1]-xp.asarray(sigma)[seg_idx])[:, None, None]
+        w = density * (2*xp.pi*source[..., 0]) * d[:, None, None]*xp.cosh(v) * (
+            .5*(hi-lo)/count)[:, None, None] * xp.asarray(gw)[None, None, :]
+        er_close, ez_close = ring_field(rho_eval[point_idx, None, None],
+            z[point_idx, None, None]-source[..., 1], source[..., 0], xp)
+        er_seg[point_idx, seg_idx] = xp.sum(xp.where(valid, w*er_close, 0.), axis=(1, 2))
+        ez_seg[point_idx, seg_idx] = xp.sum(xp.where(valid, w*ez_close, 0.), axis=(1, 2))
+    e_rho = er_seg.sum(axis=-1)
+    e_z = ez_seg.sum(axis=-1)
+    ex = xp.where(rho == 0., 0., e_rho*xp.cos(phi))
+    ey = xp.where(rho == 0., 0., e_rho*xp.sin(phi))
+    return xp.stack([ex, ey, e_z], axis=-1).reshape(shape)

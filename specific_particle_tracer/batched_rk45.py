@@ -69,7 +69,8 @@ def integrate(
     initial_step_fraction=1e-6,
     max_steps=10_000_000,
 ):
-    """Integrate every group from t=0 to t_max with its own adaptive step.
+    """Integrate every group from its own earliest birth time to t_max, with
+    its own adaptive step.
 
     Parameters
     ----------
@@ -143,8 +144,6 @@ def integrate(
 
     pos = pos0.copy()
     vel = vel0.copy()
-    t = xp.zeros(n_groups, dtype=pos0.dtype)
-    h = xp.full(n_groups, t_max * initial_step_fraction, dtype=pos0.dtype)
     t_death = xp.full((n_groups, n_emit), xp.inf, dtype=pos0.dtype)
 
     # Each group's own distinct birth times, ascending (a particle that is
@@ -158,6 +157,20 @@ def integrate(
     # the adaptive controller can spin forever trying anyway.
     checkpoints = xp.sort(t_birth, axis=1)
 
+    # Each group starts its own clock at its own earliest birth time, not
+    # at a shared t=0 -- a fixed t=0 start silently breaks the *relative*
+    # birth timing within a group whenever any member has t_birth < 0
+    # (e.g. a distgen distribution with mean(t)=0): that member would be
+    # "active" from the very first step regardless of how negative its
+    # birth time really is, since t=0 already satisfies t >= t_birth,
+    # collapsing what should be a real head-start over its later-born
+    # groupmates. Groups never interact with each other, so starting each
+    # at its own min(t_birth) (rather than the distribution's global
+    # minimum) also avoids wasting steps on a group whose own members are
+    # all born well after some other group's earliest particle.
+    t = checkpoints[:, 0].copy()
+    h = (t_max - t) * initial_step_fraction
+
     # Output times are shared by every group (unlike birth times), so they
     # get their own single sorted 1-D array and their own "how many are
     # behind us" counter per group, folded into the same `target` a step
@@ -168,6 +181,26 @@ def integrate(
     if have_output_times:
         output_times_sorted = xp.sort(output_times)
         n_out = output_times_sorted.shape[0]
+
+    if have_output_times and on_output is not None:
+        # An output time coinciding *exactly* with a group's own start time
+        # would otherwise never fire for that group: the pointer test in
+        # the loop below counts `output_times_sorted <= t` as already
+        # behind us, and t starts at that very time. Output times strictly
+        # before a group's start need no such handling -- nothing in that
+        # group is born yet, so `trajectories.record_output` would record
+        # nothing anyway -- but the exact coincidence does lose genuinely
+        # born particles (the earliest-born ones), so fire those here.
+        last_at_or_before = xp.sum(output_times_sorted[None, :] <= t[:, None], axis=1) - 1
+        at_start = (last_at_or_before >= 0) & (
+            output_times_sorted[xp.maximum(last_at_or_before, 0)] == t
+        )
+        if xp.any(at_start):
+            at_start_idx = xp.nonzero(at_start)[0]
+            ptrs = last_at_or_before[at_start_idx]
+            for p in xp.unique(ptrs):
+                sel = at_start_idx[ptrs == p]
+                on_output(int(p), sel, t[sel], pos[sel], vel[sel])
 
     running = xp.ones(n_groups, dtype=bool)
     # `idx` doubles as the loop condition below (via idx.shape[0]) instead
@@ -245,7 +278,8 @@ def integrate(
             tol = 1e-9 * xp.maximum(t_max, 1e-30)
             reached_birth_checkpoint = (~exhausted[accepted]) & (t[acc_idx] >= next_checkpoint[accepted] - tol)
             if xp.any(reached_birth_checkpoint):
-                h[acc_idx] = xp.where(reached_birth_checkpoint, t_max * initial_step_fraction, h[acc_idx])
+                h_reset = (t_max - t[acc_idx]) * initial_step_fraction
+                h[acc_idx] = xp.where(reached_birth_checkpoint, h_reset, h[acc_idx])
 
             if kill_fn is not None:
                 newly_killed = was_active & kill_fn(pos[acc_idx])

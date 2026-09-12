@@ -23,3 +23,17 @@ def ellip_ke(m, xp):
     from cupyx.scipy import special as cupy_special
 
     return cupy_special.ellipk(m), cupy_special.ellipeinc(xp.pi / 2, m)
+
+
+def ellip_ke_complement(p, xp):
+    """K(1-p), E(1-p), retaining the small complementary parameter.
+
+    Forming 1-p first loses relative accuracy near a ring singularity.
+    ellipkm1 accepts p directly on both supported backends. E is finite
+    there, so rounding its argument does not produce the same problem.
+    """
+    if xp is np:
+        from scipy import special
+        return special.ellipkm1(p), special.ellipe(1.0 - p)
+    from cupyx.scipy import special
+    return special.ellipkm1(p), special.ellipeinc(xp.pi / 2, 1.0 - p)

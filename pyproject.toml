@@ -11,7 +11,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
-bem = ["bempp-cl", "matplotlib"]
+plot = ["matplotlib"]
 
 [build-system]
 requires = ["setuptools>=61.0"]

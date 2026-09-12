@@ -23,7 +23,13 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 from .fields import GunField, HemisphericalTipField
-from .forces import coulomb_force, image_charge_force, hemispherical_tip_image_force
+from .forces import (
+    coulomb_force,
+    image_charge_force,
+    hemispherical_tip_image_force,
+    FlatCathodeImageSolution,
+    HemisphericalTipImageSolution,
+)
 
 DEFAULT_Z0 = 3.0e-9  # m (3.0 nm), effective image-charge offset
 
@@ -62,6 +68,28 @@ class Geometry(ABC):
     def from_worker_args(args, xp=np):
         """Rebuild whichever Geometry subclass `worker_args()` came from."""
         kind = args[0]
+        if kind not in _WORKER_REGISTRY:
+            # BEM geometries (bem/geometry.py) self-register into
+            # _WORKER_REGISTRY as an import-time side effect -- reliable
+            # whenever *something* in the calling process already imported
+            # that module, which is true for an ordinary script or a
+            # notebook that constructs one directly. It is NOT reliable
+            # inside a multiprocessing worker process, though: `parallel.py`
+            # (the module a spawned worker actually reconstructs its state
+            # from, since that's where the target function lives) never
+            # imports bem/geometry.py itself, and Windows' "spawn" start
+            # method does not re-run whatever an *interactive* (Jupyter)
+            # session happened to import -- only a plain script run
+            # directly gets that "for free", as a side effect of spawn
+            # re-executing the launching script's own top-level imports.
+            # So a BEM geometry built purely from a notebook fails here
+            # with a bare KeyError the first time n_workers>1 is used, even
+            # though the exact same code works from a .py script. Import it
+            # explicitly (lazily, here, to avoid a circular import at
+            # module load time -- bem/geometry.py itself imports this
+            # module) so the registry is populated regardless of what the
+            # calling context happened to import.
+            from .bem import geometry as _bem_geometry  # noqa: F401
         cls = _WORKER_REGISTRY[kind]
         return cls._from_worker_args(args[1:], xp=xp)
 
@@ -89,6 +117,29 @@ class FlatCathode(Geometry):
         self.kill_z_below = kill_z_below
         self.xp = xp
         self._field = GunField(E_gun, xp=xp)
+
+    @property
+    def field_solver(self):
+        """The underlying `fields.GunField` -- has its own
+        `.potential(position)`, e.g. for
+        `specific_particle_tracer.plotting.static_potential_grid`. Same
+        property name as `bem.geometry.HemisphericalTipBEMGeometry`'s/
+        `CylindricalWellBEMGeometry`'s, so a plotting snippet doesn't
+        care which kind of Geometry it's handed."""
+        return self._field
+
+    @property
+    def image_solution(self):
+        """A `forces.FlatCathodeImageSolution` wrapping this geometry's
+        own single-image system (the exact closed-form counterpart to
+        `bem.image_charge.ImageChargeBEMSolution`), or None if `z0` is
+        None (image force disabled) -- same `.image_potential(...)`
+        interface as that BEM class, so plotting code doesn't need to
+        know which kind of geometry it's looking at. See
+        `bem.geometry.HemisphericalTipBEMGeometry.image_solution`."""
+        if self.z0 is None:
+            return None
+        return FlatCathodeImageSolution(self.z0)
 
     def field(self, position):
         return self._field.evaluate(position)
@@ -150,6 +201,29 @@ class HemisphericalTip(Geometry):
         self.xp = xp
         self._field = HemisphericalTipField(E_gun, R, xp=xp)
 
+    @property
+    def field_solver(self):
+        """The underlying `fields.HemisphericalTipField` (the closed-form
+        analytic solution) -- has its own `.potential(position)`, e.g.
+        for `specific_particle_tracer.plotting.static_potential_grid`.
+        Same property name as `bem.geometry.HemisphericalTipBEMGeometry`'s/
+        `CylindricalWellBEMGeometry`'s, so a plotting snippet doesn't
+        care whether it's handed this analytic geometry or a BEM one."""
+        return self._field
+
+    @property
+    def image_solution(self):
+        """A `forces.HemisphericalTipImageSolution` wrapping this
+        geometry's own exact 3-image system (the closed-form counterpart
+        to `bem.image_charge.ImageChargeBEMSolution`), or None if `z0` is
+        None (image force disabled) -- same `.image_potential(...)`
+        interface as that BEM class, so plotting code doesn't need to
+        know which kind of geometry it's looking at. See
+        `bem.geometry.HemisphericalTipBEMGeometry.image_solution`."""
+        if self.z0 is None:
+            return None
+        return HemisphericalTipImageSolution(self.R - self.z0, self.z0, real_radius=self.R)
+
     def field(self, position):
         return self._field.evaluate(position)
 
@@ -157,7 +231,9 @@ class HemisphericalTip(Geometry):
         if self.z0 is None:
             return self.xp.zeros_like(position)
         image_radius = self.R - self.z0
-        return hemispherical_tip_image_force(position, charge, active, image_radius, plummer_radius, xp=self.xp)
+        return hemispherical_tip_image_force(
+            position, charge, active, image_radius, plummer_radius, plane_z0=self.z0, xp=self.xp
+        )
 
     def kill_mask(self, position):
         xp = self.xp

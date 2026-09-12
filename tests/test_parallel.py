@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from specific_particle_tracer import SpecificParticleTracer, FlatCathode
+from specific_particle_tracer.bem.geometry import CylindricalWellBEMGeometry
 
 
 def test_n_workers_gpu_combination_rejected(particle_group_factory):
@@ -23,6 +24,37 @@ def test_n_workers_more_than_groups_is_fine(particle_group_factory):
     )
     (screen_pg,), _ = tracer.run()
     assert len(screen_pg) == 3
+
+
+def test_n_workers_with_bem_geometry_does_not_raise_keyerror(particle_group_factory):
+    """Regression test: a BEM geometry (bem/geometry.py) self-registers
+    into geometry._WORKER_REGISTRY as an import-time side effect, which
+    only happens automatically in a worker process if *something* that
+    process actually imports triggers it -- true for a plain script
+    (Windows spawn re-executes the launching script's own top-level
+    imports) but NOT for a geometry built from an interactive session
+    (e.g. a Jupyter notebook), since a spawned worker reconstructs its
+    state from `parallel.py` alone, which never imports bem/geometry.py.
+    That gap produced a bare `KeyError: 'cylindrical_well_bem'` deep in a
+    worker process the first time a BEM geometry was combined with
+    n_workers>1 outside a plain script. Fixed via a lazy import inside
+    `Geometry.from_worker_args`, verified directly (in a subprocess that
+    imports only `specific_particle_tracer.geometry`, never
+    `specific_particle_tracer.bem.geometry`) -- this test instead exercises
+    it through the real multiprocess path, which is worth keeping too
+    since spawned workers are always fresh interpreters regardless of
+    what this test session itself has already imported."""
+    R, H = 25e-9, 20e-9
+    N = 4
+    pg = particle_group_factory(N, t=[0.0] * N, x=[0.0] * N, y=[0.0] * N, z=[-H] * N)
+
+    geometry = CylindricalWellBEMGeometry(-1e5, R, H, field_max_length=min(R, H) / 14)
+    tracer = SpecificParticleTracer(
+        initial_particles=pg, n_emit=2, geometry=geometry, screens=[1e-6], z_max=1.1e-6,
+        t_max=1e-13, backend="cpu", n_workers=2,
+    )
+    (screen_pg,), _ = tracer.run()
+    assert screen_pg is not None  # didn't raise -- that's the actual regression check
 
 
 def test_n_workers_matches_serial_result(particle_group_factory):

@@ -54,6 +54,22 @@ def test_ring_field_matches_finite_difference_of_ring_potential():
         assert abs(fd[1] - closed[1]) < 1e-8
 
 
+@pytest.mark.parametrize("backend", ["cpu", "gpu"])
+def test_flat_disk_field_resolves_surface_limit_without_sphere_shortcut(backend):
+    from specific_particle_tracer.bem.axisymmetric import evaluate_axisymmetric_field
+    xp = np if backend == "cpu" else pytest.importorskip("cupy")
+    profile = np.column_stack([np.linspace(0., 1., 20), np.zeros(20)])
+    sigma = np.ones(20)
+    heights = np.array([1e-7, 1e-4, .01, .1, 2.])
+    points = np.column_stack([np.zeros_like(heights), np.zeros_like(heights), heights])
+    field = evaluate_axisymmetric_field(profile, sigma, xp.asarray(points), xp=xp)
+    if xp is not np:
+        field = xp.asnumpy(field)
+    expected = .5*(1.-heights/np.sqrt(1.+heights**2))
+    np.testing.assert_allclose(field[:,2], expected, rtol=1e-7, atol=1e-10)
+    np.testing.assert_allclose(field[:,:2], 0., atol=1e-12)
+
+
 def test_uniform_sphere_field_matches_shell_theorem():
     """A uniformly-charged spherical shell's field just outside must equal
     its own surface charge density (the shell theorem's local form, and
@@ -115,7 +131,7 @@ def test_hemispherical_tip_bem_field_matches_analytic_field_off_surface():
     R = 50e-9
     Ez = -1e8
 
-    bem_field = HemisphericalTipBEMField(Ez, R, n_theta=30)
+    bem_field = HemisphericalTipBEMField(Ez, R, max_length=R * np.pi / 29)
     analytic_field = HemisphericalTipField(Ez, R)
 
     theta = np.array([0.0, 0.3, 0.9, 1.4])
@@ -137,7 +153,7 @@ def test_hemispherical_tip_bem_field_matches_analytic_field_near_surface():
     R = 50e-9
     Ez = -1e8
 
-    bem_field = HemisphericalTipBEMField(Ez, R, n_theta=30)
+    bem_field = HemisphericalTipBEMField(Ez, R, max_length=R * np.pi / 29)
     analytic_field = HemisphericalTipField(Ez, R)
 
     theta = np.array([0.0, 0.3, 0.9, 1.4])
@@ -164,12 +180,12 @@ def test_hemispherical_tip_bem_field_matches_analytic_field_exactly_on_the_surfa
     points = _valid_hemisphere_points(theta, r=R)
     E_analytic = analytic_field.evaluate(points)
 
-    def max_rel_err(n_theta):
-        bem_field = HemisphericalTipBEMField(Ez, R, n_theta=n_theta)
+    def max_rel_err(max_length):
+        bem_field = HemisphericalTipBEMField(Ez, R, max_length=max_length)
         return np.max(np.linalg.norm(bem_field.evaluate(points) - E_analytic, axis=-1)) / np.abs(Ez)
 
-    err_coarse = max_rel_err(10)
-    err_fine = max_rel_err(40)
+    err_coarse = max_rel_err(R * np.pi / 9)
+    err_fine = max_rel_err(R * np.pi / 39)
 
     assert err_coarse < 0.5
     assert err_fine < err_coarse
@@ -178,7 +194,7 @@ def test_hemispherical_tip_bem_field_matches_analytic_field_exactly_on_the_surfa
 def test_hemispherical_tip_bem_field_is_zero_inside_the_conductor():
     R = 50e-9
     Ez = -1e8
-    bem_field = HemisphericalTipBEMField(Ez, R, n_theta=15)
+    bem_field = HemisphericalTipBEMField(Ez, R, max_length=R * np.pi / 14)
 
     inside_tip = np.array([[0.0, 0.0, 0.5 * R], [0.3 * R, 0.0, 0.0]])
     below_plane = np.array([[2 * R, 0.0, -1e-9]])

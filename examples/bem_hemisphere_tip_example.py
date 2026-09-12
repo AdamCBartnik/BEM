@@ -49,7 +49,7 @@ E_gun = -1e8  # asymptotic field [V/m] (negative: accelerates electrons in +z)
 
 # --- Part 1: field values, BEM vs. the closed-form solution ---------------
 
-bem_field = HemisphericalTipBEMField(E_gun, R, n_theta=40)  # xp=np by default; pass xp=cupy for GPU
+bem_field = HemisphericalTipBEMField(E_gun, R)  # xp=np by default; pass xp=cupy for GPU
 analytic_field = HemisphericalTipField(E_gun, R)
 
 theta = np.radians([10, 30, 50, 70])  # angle from the pole
@@ -111,13 +111,13 @@ def run(label, geometry, **tracker_kwargs):
 
 print("\nPushing particles to a screen at z=3R (no image-charge/Coulomb force):")
 run("analytic", HemisphericalTip(E_gun, R, z0=None))
-run("BEM (cpu)", HemisphericalTipBEMGeometry(E_gun, R, n_theta=40))
+run("BEM (cpu)", HemisphericalTipBEMGeometry(E_gun, R))
 
 # For a GPU run (worth it once you have hundreds-to-thousands of particles
 # or a fine mesh -- see bem/axisymmetric.py's module docstring for the
 # crossover point measured on this project's own hardware):
 #
-#     run("BEM (gpu)", HemisphericalTipBEMGeometry(E_gun, R, n_theta=40), backend="gpu")
+#     run("BEM (gpu)", HemisphericalTipBEMGeometry(E_gun, R), backend="gpu")
 
 # --- Part 3: image-charge force, BEM vs. the exact 3-image analytic form --
 
@@ -127,11 +127,9 @@ from specific_particle_tracer.geometry import DEFAULT_Z0  # noqa: E402
 print(f"\nBuilding the image-charge BEM solve (z0={DEFAULT_Z0:.1e} m) -- this is the")
 print("expensive one-time step (a per-mode adaptive-quadrature operator")
 print("assembly, not a cheap linear solve): tens of seconds to a few minutes")
-print("depending on image_n_theta/n_fillet/n_r.")
+print("depending on image_max_length/image_fillet_max_length.")
 
-bem_geom_with_image = HemisphericalTipBEMGeometry(
-    E_gun, R, n_theta=40, z0=DEFAULT_Z0, image_n_theta=30, image_n_fillet=12, image_n_r=15, image_n_max=16
-)
+bem_geom_with_image = HemisphericalTipBEMGeometry(E_gun, R, z0=DEFAULT_Z0, image_n_max=16)
 
 print("\nImage-charge force, BEM vs. exact 3-image analytic (this shape has an")
 print("exact solution already -- this is a validation, not a use case). One")
@@ -146,7 +144,7 @@ for theta_deg, d_over_R in [(5.0, 0.1), (20.0, 0.1)]:
     # explicit, since only particles within the same group interact.
     F_bem = bem_geom_with_image.image_force(position.reshape(1, 1, 3), charge.reshape(1, 1), active.reshape(1, 1), plummer_radius=1e-12)[0, 0]
     F_exact = hemispherical_tip_image_force(
-        position.reshape(1, 1, 3), charge.reshape(1, 1), active.reshape(1, 1), R - DEFAULT_Z0, plummer_radius=1e-12
+        position.reshape(1, 1, 3), charge.reshape(1, 1), active.reshape(1, 1), R - DEFAULT_Z0, plummer_radius=1e-12, plane_z0=DEFAULT_Z0
     )[0, 0]
 
     rel_err = np.linalg.norm(F_bem - F_exact) / np.linalg.norm(F_exact)
@@ -168,7 +166,7 @@ active_pair = np.ones((1, 2), dtype=bool)
 
 F_bem_pair = bem_geom_with_image.image_force(positions_pair, charges_pair, active_pair, plummer_radius=1e-12)[0]
 F_exact_pair = hemispherical_tip_image_force(
-    positions_pair, charges_pair, active_pair, R - DEFAULT_Z0, plummer_radius=1e-12
+    positions_pair, charges_pair, active_pair, R - DEFAULT_Z0, plummer_radius=1e-12, plane_z0=DEFAULT_Z0
 )[0]
 for i in range(2):
     rel_err = np.linalg.norm(F_bem_pair[i] - F_exact_pair[i]) / np.linalg.norm(F_exact_pair[i])
@@ -182,6 +180,6 @@ for i in range(2):
 # before GPU actually wins over CPU for this specific operation):
 #
 #     bem_geom_gpu = HemisphericalTipBEMGeometry(
-#         E_gun, R, n_theta=40, z0=DEFAULT_Z0, image_n_max=16, xp=cupy
+#         E_gun, R, z0=DEFAULT_Z0, image_n_max=16, xp=cupy
 #     )
 #     force_gpu = bem_geom_gpu.image_force(positions_pair, charges_pair, active_pair, plummer_radius=1e-12)

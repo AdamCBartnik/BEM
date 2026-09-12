@@ -63,16 +63,18 @@ def test_hemisphere_field_zero_inside_conductor():
 # Image charge (exact 4-charge solution)
 # ----------------------------------------------------------------------
 
-def _four_charge_force(a, q0, r0, plummer_radius=0.0):
+def _four_charge_force(a, q0, r0, plummer_radius=0.0, plane_z0=0.0):
     """Reference implementation: direct pairwise Coulomb sum over the real
     charge's 3 images, used to check `hemispherical_tip_image_force`
-    against an independent calculation of the same physics."""
+    against an independent calculation of the same physics. `plane_z0`
+    recesses the image plane to z=-plane_z0, matching that function's own
+    (and `image_charge_force`'s) regularization convention."""
     d = np.linalg.norm(r0)
     r1 = (a * a / d**2) * r0
     q1 = -q0 * a / d
-    r2 = r0.copy(); r2[2] = -r0[2]
+    r2 = r0.copy(); r2[2] = -2.0 * plane_z0 - r0[2]
     q2 = -q0
-    r3 = r1.copy(); r3[2] = -r1[2]
+    r3 = r1.copy(); r3[2] = -2.0 * plane_z0 - r1[2]
     q3 = -q1
 
     force = np.zeros(3)
@@ -92,10 +94,15 @@ def test_hemispherical_tip_image_force_matches_4charge_reference():
     charge = np.array([[q0]])
     active = np.array([[True]])
 
-    force = hemispherical_tip_image_force(position, charge, active, a, plummer_radius=1e-15)
-    expected = _four_charge_force(a, q0, r0, plummer_radius=1e-15)
+    # Both the unregularized plane (plane_z0=0, the textbook 3-image
+    # system) and the recessed one the tracker actually uses.
+    for plane_z0 in (0.0, 3e-9):
+        force = hemispherical_tip_image_force(
+            position, charge, active, a, plummer_radius=1e-15, plane_z0=plane_z0
+        )
+        expected = _four_charge_force(a, q0, r0, plummer_radius=1e-15, plane_z0=plane_z0)
 
-    assert np.allclose(force[0, 0], expected, rtol=1e-6)
+        assert np.allclose(force[0, 0], expected, rtol=1e-6)
 
 
 def test_hemispherical_tip_image_potential_zero_on_both_boundaries():

@@ -6,6 +6,31 @@ from specific_particle_tracer.bem.toroidal import toroidal_Q
 mp = pytest.importorskip("mpmath")
 
 
+@pytest.mark.parametrize("n_max", [0, 16, 64, 128])
+def test_near_coincidence_and_recurrence_switch_match_high_precision(n_max):
+    M = max(n_max, 1)
+    chi = np.array([np.nextafter(1., 2.), 1.+1e-13, 1.+1e-10,
+                    1.+1e-6, np.cosh(.999/M), np.cosh(1.001/M), 1.02, 2.])
+    q, dq = toroidal_Q(chi, n_max)
+    with mp.workdps(60):
+        for i, c in enumerate(chi):
+            x = mp.mpf(float(c))  # compare at the same representable input
+            for n in sorted(set([0, n_max//2, n_max])):
+                fn = lambda y: mp.legenq(mp.mpf(n)-.5, 0, y, type=3).real
+                assert q[n, i] == pytest.approx(float(fn(x)), rel=1e-10, abs=0.)
+                assert dq[n, i] == pytest.approx(float(mp.diff(fn, x)), rel=1e-10, abs=0.)
+
+
+@pytest.mark.parametrize("n_max", [0, 32, 69])
+def test_mixed_near_and_far_batch_on_gpu(n_max):
+    cp = pytest.importorskip("cupy")
+    chi = np.array([np.nextafter(1., 2.), 1.+1e-12, 1.+1e-6, 1.001, 1.1, 5.])
+    expected = toroidal_Q(chi, n_max)
+    actual = toroidal_Q(cp.asarray(chi), n_max, xp=cp)
+    for cpu, gpu in zip(expected, actual):
+        np.testing.assert_allclose(cp.asnumpy(gpu), cpu, rtol=1e-10, atol=0.)
+
+
 def _Q_mpmath(n, chi, dps=30):
     mp.mp.dps = dps
     return float(mp.legenq(n - 0.5, 0, chi, type=3).real)

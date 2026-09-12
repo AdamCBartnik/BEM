@@ -68,29 +68,51 @@ def find_crossings_grouped(
     weight = weight_grouped[group_idx]
     group_col = xp.broadcast_to(group_idx[:, None], (k, n_emit))
 
+    if not recorders:
+        return
+    # Split each cubic at its extrema, so each bracket is monotone and
+    # every crossing is found even when the step endpoints have equal signs.
+    z0, z1 = pos_old[..., 2], pos_new[..., 2]
+    u0, u1 = dt_full*vel_old[..., 2], dt_full*vel_new[..., 2]
+    A = 3*(2*(z0-z1) + u0 + u1)
+    B = 2*(3*(z1-z0) - 2*u0 - u1)
+    C = u0
+    scale = xp.maximum(xp.maximum(xp.abs(A), xp.abs(B)), xp.abs(C))
+    scale = xp.where(scale > 0., scale, 1.)
+    A, B, C = A/scale, B/scale, C/scale
+    disc = B*B - 4*A*C
+    q = -.5*(B + xp.where(B >= 0., 1., -1.)*xp.sqrt(xp.maximum(disc, 0.)))
+    r0 = q / xp.where(A != 0., A, 1.)
+    r1 = C / xp.where(q != 0., q, 1.)
+    linear = -C / xp.where(B != 0., B, 1.)
+    r0 = xp.where(A == 0., linear, r0)
+    valid0 = (disc >= 0.) & ((A != 0.) | (B != 0.)) & (r0 > 0.) & (r0 < 1.)
+    valid1 = (disc >= 0.) & (A != 0.) & (q != 0.) & (r1 > 0.) & (r1 < 1.)
+    cuts = xp.sort(xp.stack([xp.zeros_like(r0), xp.where(valid0, r0, 1.),
+                            xp.where(valid1, r1, 1.), xp.ones_like(r0)], axis=-1), axis=-1)
+    # Frozen/unborn states retain their stored velocity; that must not
+    # create fictitious Hermite excursions from unchanged endpoints.
+    moving = xp.any(pos_old != pos_new, axis=-1) | xp.any(vel_old != vel_new, axis=-1)
     for recorder in recorders:
-        z0 = pos_old[..., 2] - recorder.z
-        z1 = pos_new[..., 2] - recorder.z
-        crossed = (z0 == 0.0) | (xp.sign(z0) != xp.sign(z1))
-        if not xp.any(crossed):
-            continue
-
-        gi, pi = xp.nonzero(crossed)
-
-        p0, v0 = pos_old[gi, pi], vel_old[gi, pi]
-        p1, v1 = pos_new[gi, pi], vel_new[gi, pi]
-        dtc = dt_full[gi, pi]
-        t0c = t_old_full[gi, pi]
-
-        s = _bisect_hermite_z_root(p0[:, 2], v0[:, 2], p1[:, 2], v1[:, 2], dtc, recorder.z, xp)
-        pos_c = _hermite(p0, v0, p1, v1, dtc, s)
-        vel_c = _hermite_derivative(p0, v0, p1, v1, dtc, s)
-        t_c = t0c + s * dtc
-
-        recorder.record(
-            t_c, pos_c, vel_c,
-            charge[gi, pi], ids[gi, pi], weight[gi, pi], group_col[gi, pi],
-        )
+        for interval in range(3):
+            left, right = cuts[..., interval], cuts[..., interval+1]
+            f0 = _hermite_z(z0, vel_old[..., 2], z1, vel_new[..., 2], dt_full, left)-recorder.z
+            f1 = _hermite_z(z0, vel_old[..., 2], z1, vel_new[..., 2], dt_full, right)-recorder.z
+            # Half-open time interval (t_old, t_new]: landing on a screen
+            # belongs to this step and is not recorded again next step.
+            crossed = moving & (right > left) & (dt_full > 0.) & (f0 != 0.) & (
+                (xp.sign(f0) != xp.sign(f1)))
+            gi, pi = xp.nonzero(crossed)
+            if not gi.size:
+                continue
+            p0, v0 = pos_old[gi, pi], vel_old[gi, pi]
+            p1, v1 = pos_new[gi, pi], vel_new[gi, pi]
+            dtc, t0c = dt_full[gi, pi], t_old_full[gi, pi]
+            ss = _bisect_hermite_z_root(p0[:, 2], v0[:, 2], p1[:, 2], v1[:, 2],
+                dtc, recorder.z, xp, lo=left[gi, pi], hi=right[gi, pi])
+            recorder.record(t0c+ss*dtc, _hermite(p0,v0,p1,v1,dtc,ss),
+                _hermite_derivative(p0,v0,p1,v1,dtc,ss),
+                charge[gi,pi], ids[gi,pi], weight[gi,pi], group_col[gi,pi])
 
 
 def _hermite_basis(s):
@@ -130,9 +152,9 @@ def _hermite_z(p0z, v0z, p1z, v1z, dt, s):
     return h00 * p0z + h10 * dt * v0z + h01 * p1z + h11 * dt * v1z
 
 
-def _bisect_hermite_z_root(p0z, v0z, p1z, v1z, dt, target, xp):
-    lo = xp.zeros_like(p0z)
-    hi = xp.ones_like(p0z)
+def _bisect_hermite_z_root(p0z, v0z, p1z, v1z, dt, target, xp, lo=None, hi=None):
+    lo = xp.zeros_like(p0z) if lo is None else lo.copy()
+    hi = xp.ones_like(p0z) if hi is None else hi.copy()
     f_lo = _hermite_z(p0z, v0z, p1z, v1z, dt, lo) - target
 
     for _ in range(_BISECTION_ITERATIONS):

@@ -1,0 +1,343 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+
+\title{BEM Solver}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+These notes describe a cylindrically symmetric Boundary Element Method (BEM) that is used to solve for the electrostatic environment around a nano-structured photocathode. We solve for both the static accelerating fields and also the ``image charge'' fields induced on any emitted electrons. Though the problem is generally three-dimensional, we show that expanding in angular harmonics can reduce it to independent two-dimensional problems, one for each
+azimuthal harmonic $m$.  This makes it possible to treat off-axis point charges
+without ever introducing an angular mesh, and makes an overall rotation of the point sources an exact symmetry of the method. Finally, we explain how for certain nano-geometries, it is possible to use inversion symmetry to handle the boundary condition on the infinite grounded plane, without needing a mesh on that boundary.
+\end{abstract}
+
+\section{What problem are we solving?}
+
+We model the nano-structured photocathode as a perfect conductor with surface $S$, surrounded by a vacuum region denoted by $\Omega$. We only treat the case of a single conductor, so we choose the potential on the conductor's surface to be zero.
+An externally applied potential
+$\Phi_{\mathrm{ext}}$ is added inside $\Omega$ (e.g. a constant accelerating field, or the Coulomb field from an emitted electron), and the
+conductor responds by producing an induced potential $\Phi$ such that
+\begin{equation}
+  \nabla^2 \Phi = 0 \ \text{ in } \Omega,
+  \qquad
+  \Phi = -\Phi_{\mathrm{ext}} \ \text{ on } S,
+  \qquad
+  \Phi \to 0 \ \text{ at infinity}.
+  \label{eq:dirichlet}
+\end{equation}
+The total potential $\Phi_{\mathrm{ext}}+\Phi$ therefore vanishes on the conductor and goes asymptotically to any applied field far from the cathode.
+
+Boundary Element Methods do not solve Laplace's equation on a three-dimensional volume.
+Instead, we write the field in terms of an unknown surface charge density $\sigma$ on
+the conductor,
+\begin{equation}
+  \Phi(\mathbf{x}) = \frac{1}{4\pi\varepsilon_0}
+  \int_S \frac{\sigma(\mathbf{y})}{|\mathbf{x}-\mathbf{y}|}
+  \, dS(\mathbf{y}).
+  \label{eq:single-layer}
+\end{equation}
+We then choose $\sigma$ so that this potential satisfies the boundary condition
+in Eq.~\eqref{eq:dirichlet}.  Numerically, the surface is broken up into a finite number of segments that allow for an approximate solution to the problem.
+
+The same machinery is used for two physically different excitations.
+
+\begin{description}
+\item[Applied field.] For a uniform field along $z$,
+  $\Phi_{\mathrm{ext}}=-E_z z$.  The induced surface charge tells us how the
+  conductor distorts and screens that field around the geometric feature.
+
+\item[Point charges / image response.] Here $\Phi_{\mathrm{ext}}$ is the
+  Coulomb potential of one or more charges in the vacuum.  Solving for the
+  induced surface charge gives the induced image field.
+\end{description}
+
+The distinction matters because the applied field case is cylindrically symmetric, while an
+off-axis point charge is not.  The cathode geometry itself may still be cylindrically symmetric in both cases, but the excitation breaks that symmetry.
+
+\section{Using rotational symmetry without assuming a cylindrically symmetric source}
+
+Suppose the conductor is a surface of revolution about $\hat z$, defined by a curve $\Gamma$ in $(\rho,z)$. Write the surface charge density as a sum over angular Fourier components,
+\begin{equation}
+  \sigma(s,\phi) = \sum_{m \ge 0}
+  \Big[ \sigma^c_m(s)\cos m\phi + \sigma^s_m(s)\sin m\phi \Big],
+  \qquad s \ \text{along } \Gamma.
+\end{equation}
+and let the boundary conditions of the potential be specified by similarly defined Fourier coefficients $g^{c,s}_m$. Orthogonality of the Fourier components can be used to show that,
+\begin{equation}
+  \int_\Gamma K_m(\rho,z;\rho',z')\,
+  \sigma^{c,s}_m(s')\, \rho'\, ds'
+  = g^{c,s}_m(s),
+  \qquad m = 0,1,2,\dots,
+  \label{eq:per-mode}
+\end{equation}
+where
+\begin{equation}
+  K_m(\rho,z;\rho',z')
+  = \frac{Q_{m-\frac12}(\chi)}{2\pi \varepsilon_0 \sqrt{\rho\rho'}},
+  \label{eq:ring-kernel}
+\end{equation}
+$Q_{m-\frac12}$ is a half-integer Legendre function of the second kind, and $\chi$ is defined as
+\begin{equation}
+  \chi = \frac{\rho^2 + \rho'^2 + (z-z')^2}{2\rho\rho'} \ > 1.
+\end{equation}
+That is, each angular mode of the source potential only excites that particular angular mode in the induced potential, and the problem for each mode is purely in the $(\rho,z)$ plane.
+
+Two practical facts are important here.  First, the modes are completely
+uncoupled.  With $P$ boundary nodes, we solve one $P\times P$ system $A_m$ for
+each $m$, not one giant $(MP)\times(MP)$ system.  Second, the same matrix $A_m$
+applies to both the cosine and sine coefficients.  The geometry and kernel do
+not distinguish between them; only the excitation does.
+
+Conveniently, a point source can be expanded in the same basis using the same functions,
+\begin{equation}
+  \frac{1}{|\mathbf{x}-\mathbf{x}_0|}
+  = \frac{1}{\pi\sqrt{\rho\rho_0}}
+    \sum_{m\ge 0} (2-\delta_{m0})\, Q_{m-\frac12}(\chi_0)\,
+    \cos\!\big(m(\phi-\phi_0)\big),
+  \label{eq:point-expansion}
+\end{equation}
+where $\chi_0$ is formed from the field point $(\rho,z)$ and source position
+$(\rho_0,z_0)$.  These Fourier coefficients supply the right-hand sides $g_m^{c,s}$ for the
+image-response solve.
+
+A useful way to think about this is that the azimuthal coordinate is treated
+analytically rather than meshed.  There is no $\phi$ grid anywhere in the
+solver.  The source azimuth enters exactly through the Fourier factors, and the
+only azimuthal approximation is that in practice the series is stopped at some
+finite $m=M$.
+
+\subsection{Evaluating the kernels near coincidence}
+
+Write $\eta=\operatorname{arccosh}\chi$. The unwanted solution in an upward
+Legendre recurrence grows relative to $Q$ roughly as $e^{2m\eta}$. Thus
+upward recurrence is unsuitable at large $m\eta$, but can be used near
+coincidence for a finite range of modes. The implementation uses the
+elliptic-integral seeds $Q_{-1/2}$ and $Q_{1/2}$ and recurs upward when
+$\max(M,1)\eta\leq1$. Elsewhere it uses downward ratio recurrence.
+The switch applies separately to each field/source pair, including on the
+GPU. Values and derivatives on both sides of the switch are checked
+against high-precision Legendre functions.
+
+The small complementary elliptic parameter is computed directly as
+$p=(\chi-1)/(\chi+1)$, rather than by subtracting an already-rounded
+parameter from one. Likewise, derivative denominators use
+$(\chi-1)(\chi+1)$ instead of $\chi^2-1$.
+
+For the static field, nearby meridional segments require more quadrature
+resolution than distant ones. With $s_c$ the closest point on a segment
+and $d$ its distance from the query, the substitution
+$s=s_c+d\sinh v$ resolves the narrow peak with a number of quadrature
+points growing only logarithmically with segment length divided by $d$.
+This integrates the actual surface density; replacing a constant density
+over the whole surface by a local planar field is not an exact identity.
+Queries exactly on the piecewise-linear surface use a small exterior
+displacement proportional to the local element length. At polygon
+corners a unique finite field need not exist, so profile refinement
+remains necessary when interpreting surface fields.
+
+\section{What does truncating the azimuthal series actually do?}
+
+Stopping the point-source expansion at $m\le M$ is the main approximation in
+the azimuthal direction.  It removes fine angular structure, but it does
+\emph{not} introduce preferred absolute angles.
+
+To see why, rotate every source by the same angle $\alpha$.  For each fixed
+mode $m$, the cosine and sine components transform as
+\begin{equation}
+  \begin{pmatrix} g^c_m \\ g^s_m \end{pmatrix}
+  \longmapsto
+  \begin{pmatrix} \cos m\alpha & -\sin m\alpha \\
+                  \sin m\alpha & \cos m\alpha \end{pmatrix}
+  \begin{pmatrix} g^c_m \\ g^s_m \end{pmatrix}.
+  \label{eq:mode-rotation}
+\end{equation}
+So a physical rotation by $\alpha$ simply rotates the cosine/sine pair of mode
+$m$ by the angle $m\alpha$.  Crucially, it never mixes one value of $m$ with
+another.
+
+The same matrix $A_m$ acts on both members of the cosine/sine pair, and $A_m$
+does not depend on the absolute source azimuth.  Therefore the solved surface
+charge coefficients rotate in exactly the same way as the boundary data.  If
+the field point is rotated along with the sources, the reconstructed field is
+just the rigidly rotated version of the original field.
+
+This remains true after truncation because truncation removes complete modes.
+Keeping $m=0,\ldots,M$ still leaves each retained mode with its full cosine/sine
+pair and therefore with its exact rotational transformation law.  In that
+sense, rotational covariance is exact at every $M$: changing the absolute
+orientation of the same physical configuration does not change the numerical
+answer except for rotating the vector components. For several point charges, this means the computed forces depend on azimuths only through relative angles $\phi_i-\phi_j$.
+
+What truncation \emph{does} cost is angular resolution.  A charge very close to
+the conductor produces a narrow peak in the induced surface charge, and a
+narrower peak requires larger $m$ to represent.  The important angular scale is
+therefore set mainly by the charge's standoff from the surface, not by the
+azimuthal separation between two charges.
+
+There is one coordinate special case at $\rho\to0$.  The azimuth becomes
+undefined on the axis and $\chi\to\infty$ in Eq.~\eqref{eq:ring-kernel}.  This
+is a cylindrical-coordinate singularity rather than a failure of the mode
+expansion, and numerically it is handled with a floor on $\rho$.  A source
+exactly on the axis is even simpler: the physical configuration itself becomes
+axisymmetric, only $m=0$ is excited, and the transverse field at the source
+vanishes by symmetry.  This should not be confused with evaluating the field
+\emph{on} the axis from an off-axis source; that field can have a nonzero
+transverse component, carried by the $m=1$ mode.
+
+\section{Local image subtraction near the surface}
+
+As a source charge approaches the conductor, the potential at the boundary becomes sharply
+peaked.  If the charge is a distance $d$ from the surface, the angular width of
+that peak scales with $d$, so the number of Fourier modes needed to resolve it
+grows roughly like $1/d$, and brute-force mode
+summation becomes expensive.
+
+The solver therefore removes the most singular local behavior analytically.
+Let $\mathbf{x}_0$ be the real charge position, and let $\mathbf{x}_0^\ast$ be
+its reflection through the tangent plane at the nearest point on the conductor.
+Place an auxiliary charge $-qw$ at $\mathbf{x}_0^\ast$, where $0\le w\le1$ is
+a smooth cutoff that fades the correction away as the source moves farther from
+the surface.  Call its potential $\Phi_{\mathrm{img}}$.
+
+Instead of asking the BEM to reproduce the full sharply peaked boundary data,
+solve only for the residual surface charge using the modified boundary data
+$-(g_{\mathrm{direct}}+g_{\mathrm{img}})$.  The physical potential is then
+reconstructed as
+\begin{equation}
+  \Phi_{\mathrm{induced}}
+  = \mathcal{S}[\sigma_{\mathrm{res}}] + \Phi_{\mathrm{img}},
+  \label{eq:reconstruct}
+\end{equation}
+where $\mathcal{S}$ denotes the surface-charge potential in
+Eq.~\eqref{eq:single-layer}.
+
+Provided the reflected charge lies inside the metal, the cutoff $w$ only
+changes how the solution is split between the analytic image term and the BEM
+residual.  It can change convergence dramatically, but it cannot change a
+fully converged answer.
+
+If the reflected point lands back in the vacuum, the logic above no longer
+works, and the method fails.  This failure is most likely where the tangent plane is a bad local description
+of the conductor, especially near a corner, edge, or cusp where the normal is
+discontinuous or undefined, and can be avoided by smoothing the geometry.
+
+\section{The infinite plane boundary}
+
+We are interested in compact nano-features that are attached to an
+otherwise infinite grounded plane.  Of course, the full infinite plane cannot be meshed
+literally, and there are two ways to workaround this.  If the nano-feature protrudes above the plane, symmetry can be used to remove the plane exactly, and only a mesh on the feature itself is needed.  On the other hand, for a cavity cut into the plane, the same trick does not work and the infinite plane must instead be meshed out to some finite distance.
+
+\subsection{Protrusions: remove the plane by mirror antisymmetry}
+
+Assume the conductor fills the half-space below $z=0$, with a bounded body $B$
+protruding into the upper half-space.  Reflect $B$ through $z=0$ and join it to
+its mirror image.  Call the resulting closed, doubled body $\widetilde{B}$.
+
+Now consider an excitation that is antisymmetric across the plane,
+\begin{equation}
+  \Phi_{\mathrm{ext}}(\rho,\phi,-z)
+  = -\Phi_{\mathrm{ext}}(\rho,\phi,z).
+  \label{eq:antisym}
+\end{equation}
+The doubled geometry is symmetric under $z\mapsto-z$, while the excitation
+changes sign.  Therefore the induced solution must also change sign under that
+reflection.  A function that is antisymmetric across $z=0$ is exactly zero on
+$z=0$.
+
+This means the grounded-plane boundary condition is satisfied automatically.
+We can solve the exterior problem around the closed body $\widetilde{B}$ with no
+plane in the mesh at all, then keep only the solution in the upper half-space.
+There is no approximation in this step: the infinite plane has been removed by
+symmetry, not truncated.
+
+Both excitations used by the solver can be put in this antisymmetric form.
+
+\begin{itemize}
+\item \textbf{Uniform applied field.} The potential
+  $\Phi_{\mathrm{ext}}=-E_z z$ is already antisymmetric in $z$.
+
+\item \textbf{Point charge.} A single charge above the plane is not
+  antisymmetric by itself.  Add an image charge of opposite sign at the
+  reflected position below the plane.  The real-plus-image pair is
+  antisymmetric and can therefore be used with the doubled body.
+\end{itemize}
+
+\subsection{Depressions: why the mirror trick no longer works}
+
+Now reverse the geometry.  The conductor still fills the half-space below
+$z=0$, but a cavity $D$ is cut into it.  The vacuum consists of the entire upper
+half-space plus the interior of that cavity.
+
+For a protrusion, reflecting the vacuum through $z=0$ gives a complementary
+region below the plane.  The original and reflected vacuum regions fit together
+without overlapping, and together they form exactly the space outside the
+doubled closed body.  That is why the mirror construction can replace the plane
+by an ordinary closed-surface BEM problem.
+
+For a cavity, part of the vacuum already extends below the plane.  Reflecting
+that cavity produces a region above the plane, but the upper half-space was
+already vacuum.  The original and reflected vacuum regions therefore overlap
+through a finite volume instead of fitting together as complementary halves.
+There is no closed doubled body whose exterior is obtained by joining the two
+copies.
+
+For a depression, the plane must be included explicitly and cut off at a finite
+radius.  That finite-radius cutoff is a genuine numerical approximation, so its
+error must be checked by increasing the truncation radius until the result
+converges.  This is a real qualitative difference between a bump and a cavity:
+one admits an exact symmetry reduction, while the other requires a controlled
+large-domain approximation.
+
+\section{Superposition: several charges and independent groups}
+
+The per-mode equations in Eq.~\eqref{eq:per-mode} are linear.  For several
+charges, their Fourier boundary data can therefore be added first and solved in
+one combined BEM solve.  The resulting induced surface charge is exactly the
+sum of the responses that would have been obtained by solving each source
+separately.
+
+This is useful because every real charge then feels the field produced by the
+same jointly polarized conductor.  The conductor-mediated interaction between
+charges is therefore obtained naturally from a shared solve, without an extra
+solve for every pair.
+
+\section{Summary of the solver structure}
+
+\begin{itemize}
+\item The BEM first replaces the three-dimensional vacuum problem by a surface
+  charge problem.  For a surface of revolution, a Fourier expansion in azimuth
+  then reduces that surface problem to independent one-dimensional integral
+  equations along the generating curve.
+
+\item The per-mode kernel is the ring kernel in Eq.~\eqref{eq:ring-kernel},
+  expressed through the toroidal harmonic $Q_{m-1/2}$.  There is no azimuthal
+  mesh; source azimuths are represented analytically, and the only angular
+  approximation is truncation at a finite $m=M$.
+
+\item Truncation removes angular detail but preserves rotational covariance
+  exactly because rotations mix only the cosine and sine components within a
+  fixed $m$.  Absolute orientation therefore does not matter numerically; only
+  relative azimuths do.
+
+\item A nearby source requires many modes because its induced surface charge is
+  sharply localized.  Subtracting a local tangent-plane image removes that
+  singular part analytically and accelerates convergence.  The subtraction is
+  exact as long as the reflected auxiliary charge lies inside the conductor.
+
+\item A protrusion on an infinite grounded plane can be replaced exactly by a
+  mirror-doubled body with an antisymmetric excitation.  For point charges, the
+  required image source also supplies the physical image field of the plane.
+
+\item A depression or cavity cannot use the same mirror reduction because the
+  reflected vacuum overlaps the original vacuum rather than complementing it.
+  The plane must then be truncated explicitly, and convergence with truncation
+  radius must be checked numerically.
+\end{itemize}
+
+\end{document}
