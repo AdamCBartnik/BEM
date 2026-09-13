@@ -25,7 +25,17 @@ DEFAULT_RTOL = 1e-7
 # demands, and for positions it keeps a component passing through zero (x or
 # y near the axis, z at the cathode plane) from demanding impossible
 # precision. 1e-12 m is below every length scale in these problems, so
-# there is nothing to gain by loosening it.
+# there is nothing to gain by loosening it -- and it fails in two opposite
+# ways on either side. Too loose (1e-9 and up) silently degrades position
+# control to the scale of the geometry itself: for a particle a nanometre
+# off the surface, rtol*|pos| is ~1e-16 m, so atol becomes the binding
+# tolerance and errors of order the whole feature size are accepted. Too
+# tight (roughly 1e-16 and below) stops the integration converging at all:
+# a velocity component that starts at exactly zero then has its error
+# compared against a bound below the force evaluation's own floating-point
+# noise, and since that noise shrinks only like h rather than like h^5, the
+# step controller collapses h without ever passing the test. That failure
+# looks like a hang rather than a wrong answer.
 DEFAULT_ATOL = 1e-12
 
 
