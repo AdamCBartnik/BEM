@@ -20,7 +20,12 @@ from .screens import ScreenRecorder, find_crossings_grouped
 from .trajectories import TrajectoryRecorder, record_output
 
 DEFAULT_PLUMMER_RADIUS = 1e-12  # m (1 pm)
-DEFAULT_RTOL = 1e-8
+DEFAULT_RTOL = 1e-7
+# atol is a floor only: for velocities it sits far below what rtol already
+# demands, and for positions it keeps a component passing through zero (x or
+# y near the axis, z at the cathode plane) from demanding impossible
+# precision. 1e-12 m is below every length scale in these problems, so
+# there is nothing to gain by loosening it.
 DEFAULT_ATOL = 1e-12
 
 
@@ -115,7 +120,14 @@ class SpecificParticleTracer:
     rtol, atol : float, optional
         Relative and absolute convergence tolerance for the RK45
         integration, RMS-combined over each group's own (position [m],
-        velocity [m/s]) state. Defaults are 1e-8 and 1e-12.
+        velocity) state. `atol` is a floor in metres for position and in
+        dimensionless beta = v/c for velocity, so one value means something
+        comparable in both channels. Defaults are 1e-7 and 1e-12: measured
+        on a cylindrical-well trajectory, the integrator's own error at
+        rtol=1e-7 is already ~90x smaller than the shift from changing the
+        image-charge mode count, so tightening rtol further buys accuracy
+        the force model does not have. Spend it on `image_n_max` and mesh
+        resolution instead.
     t_max : float, optional
         Total simulated time [s]. If not given, a default is chosen from
         the single-particle transit time to the farthest screen.

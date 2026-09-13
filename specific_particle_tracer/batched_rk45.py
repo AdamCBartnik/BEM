@@ -24,6 +24,8 @@ here.
 
 import numpy as np
 
+from .constants import SPEED_OF_LIGHT
+
 # Dormand-Prince 5(4) coefficients (same pair scipy's RK45 uses).
 _C = np.array([0.0, 1 / 5, 3 / 10, 4 / 5, 8 / 9, 1.0])
 _A = [
@@ -97,7 +99,11 @@ def integrate(
         Common stopping time for every group [s].
     rtol, atol : float
         Convergence tolerance, RMS-combined over each group's own
-        (position, velocity) state.
+        (position, velocity) state. `atol` is a floor in metres for the
+        position components and in dimensionless beta = v/c for the
+        velocity components, so that one scalar is meaningful for both
+        (see `_attempt_step`). Non-relativistic here: the normalization is
+        by c alone, not by gamma*beta.
     on_step : callable, optional
         Called after every batch of accepted steps as
         ``on_step(group_idx, t_old, pos_old, vel_old, t_new, pos_new, vel_new)``
@@ -366,8 +372,17 @@ def _attempt_step(accel_fn, pos, vel, t, h, t_birth, t_death, group_idx, rtol, a
     err_pos = h[:, None, None] * sum(_E[i] * k_pos[i] for i in range(_N_STAGES + 1))
     err_vel = h[:, None, None] * sum(_E[i] * k_vel[i] for i in range(_N_STAGES + 1))
 
+    # The velocity channel's error is measured in units of c (i.e. on beta)
+    # rather than in m/s, so that one scalar `atol` means something
+    # comparable in both channels. Writing the beta-space criterion
+    # |err_vel|/c <= atol + rtol*|vel|/c and multiplying through by c
+    # leaves the relative term untouched -- it is already scale-free -- and
+    # simply converts atol's units from m/s to dimensionless beta.
+    # Without this, a single atol is being compared against metres in one
+    # channel and metres-per-second in the other, so its effective
+    # tightness differs between them by ~c.
     scale_pos = atol + rtol * xp.maximum(xp.abs(pos), xp.abs(pos_new))
-    scale_vel = atol + rtol * xp.maximum(xp.abs(vel), xp.abs(vel_new))
+    scale_vel = SPEED_OF_LIGHT * atol + rtol * xp.maximum(xp.abs(vel), xp.abs(vel_new))
 
     n_components = 2 * pos.shape[1] * 3
     sq = (
