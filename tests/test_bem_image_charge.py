@@ -262,7 +262,17 @@ def test_mirror_symmetric_hemisphere_tip_matches_exact_three_image_analytic_solu
 
 def test_mirror_symmetric_hemisphere_tip_cross_coupling_matches_exact_multi_image():
     """Same cross-coupling check as the truncated-plane path's own
-    multi-particle test, but for `image_mirror_symmetric=True`."""
+    multi-particle test, but for `image_mirror_symmetric=True`.
+
+    The tolerance here is deliberately tight, and tied to what the
+    single-particle case achieves. An earlier 3% tolerance passed at 2.6%
+    while the plane-image cross term (real particle i against particle j's
+    mirror, j != i) was missing entirely -- loose enough to hide a real
+    bug. The useful signal was the *ratio*: single-particle agreement was
+    ~1e-4 in the same configuration, so a two-particle result 200x worse
+    was never mode truncation. Adding the cross term brought this to
+    ~2e-3, so anything above 5e-3 means a term has gone missing again
+    rather than that the mesh needs refining."""
     from specific_particle_tracer.forces import hemispherical_tip_image_force
 
     R = 50e-9
@@ -281,7 +291,7 @@ def test_mirror_symmetric_hemisphere_tip_cross_coupling_matches_exact_multi_imag
     F_exact = hemispherical_tip_image_force(positions, charges, active, R - z0, plummer_radius=1e-12, plane_z0=z0)[0]
 
     rel_err = np.linalg.norm(F_bem - F_exact, axis=-1) / np.linalg.norm(F_exact, axis=-1)
-    assert np.max(rel_err) < 0.03
+    assert np.max(rel_err) < 5e-3
 
 
 def test_doubled_sphere_includes_every_direct_phantom_image():
