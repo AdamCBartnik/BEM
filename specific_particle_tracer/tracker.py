@@ -178,6 +178,20 @@ class SpecificParticleTracer:
         self.output_times_host = None if t_out is None else np.sort(np.asarray(t_out, dtype=float))
         self.plummer_radius = plummer_radius
         self.z_max = z_max
+        # A screen beyond z_max can never be reached by a live particle, so
+        # anything recorded there is spurious -- and worse, the count is not
+        # even stable: kill_fn is only tested at step ends, so a single step
+        # spanning both z_max and the screen registers a crossing that a
+        # finer step would have killed first. That makes the tally depend on
+        # step size, i.e. on rtol or on whether t_out was passed.
+        if z_max is not None and self.screen_positions and z_max < max(self.screen_positions):
+            warnings.warn(
+                f"z_max={z_max!r} is below the furthest screen "
+                f"({max(self.screen_positions)!r}): particles are killed before reaching it, so "
+                "crossings recorded at screens beyond z_max are spurious and their number will "
+                "vary with step size. Raise z_max above every screen, or drop those screens.",
+                stacklevel=2,
+            )
         self.n_workers = os.cpu_count() if n_workers is None else n_workers
 
         self.backend_name = backend
